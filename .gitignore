@@ -1,0 +1,23 @@
+﻿# Python/runtime
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local IDE metadata
+.idea/
+
+# Large local datasets and generated artifacts
+data/raw/
+data/processed/
+outputs/
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+*.parquet
+
+# Local logs/caches
+*.log
+.cache/
