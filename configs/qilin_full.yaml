@@ -2,7 +2,7 @@ seed: 2026
 device: cuda
 
 data:
-  processed_dir: data/processed/qilin_full
+  processed_dir: data/processed/qilin_full_multimodal_meta
   train_file: train.parquet
   valid_file: valid.parquet
   test_file: test.parquet
@@ -17,22 +17,34 @@ model:
   name: HeteroIntentPLE
   ranker: ple
   embed_dim: 64
-  hidden_dim: 128
-  dropout: 0.1
+  hidden_dim: 512
+  dropout: 0.15
   max_position: 200
   transformer_layers: 2
   transformer_heads: 4
-  shared_experts: 4
-  task_experts: 2
-  ple_layers: 2
+  shared_experts: 8
+  task_experts: 4
+  ple_layers: 3
   use_graph_embedding: true
   graph_embedding_trainable: false
 
 loss:
-  click_weight: 0.3
-  collect_weight: 0.4
-  share_weight: 0.3
-  bpr_weight: 0.0
+  task_weights:
+    click: 0.3
+    collect: 0.4
+    share: 0.3
+  positive_weights:
+    click: 1.0
+    collect: 4.0
+    share: 3.0
+  negative_weights:
+    click: 1.0
+    collect: 1.0
+    share: 1.0
+  bpr_weight: 0.01
+  task_bpr_weight: 0.005
+  bpr_max_groups: 64
+  bpr_max_pairs_per_group: 32
   transition_weight: 0.0
   type_transition_weight: 0.03
   taxonomy_transition_weight: 0.03
@@ -42,12 +54,13 @@ loss:
 
 train:
   epochs: 30
-  lr: 0.001
+  lr: 0.0003
   weight_decay: 0.0001
   grad_clip: 5.0
-  patience: 5
+  patience: 8
+  min_epochs: 12
   amp: true
-  output_dir: outputs/qilin_full_dynamic
+  output_dir: outputs/qilin_full_multimodal_meta
 
 evaluation:
   topk: 20

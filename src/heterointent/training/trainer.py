@@ -62,6 +62,14 @@ def predict_frame(model: nn.Module, loader, device: torch.device) -> pd.DataFram
             frame[task] = labels[:, task_idx].astype("int8", copy=False)
             frame[f"p_{task}"] = probs[:, task_idx]
 
+        if "modality_gate" in outputs:
+            gate = outputs["modality_gate"].detach().cpu().numpy()
+            part_names = list(getattr(getattr(model, "item_encoder", None), "part_names", []))
+            if len(part_names) != gate.shape[1]:
+                part_names = [f"part_{idx}" for idx in range(gate.shape[1])]
+            for part_idx, part_name in enumerate(part_names):
+                frame[f"gate_{part_name}"] = gate[:, part_idx].astype("float32", copy=False)
+
         dynamic_cols = [
             "target_item_type",
             "target_taxonomy_id",
@@ -168,6 +176,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
     scaler = torch.amp.GradScaler("cuda", enabled=bool(config["train"].get("amp", False)) and device.type == "cuda")
 
     patience = int(config["train"].get("patience", 3))
+    min_epochs = int(config["train"].get("min_epochs", 0))
     stale = 0
     history: list[dict] = []
     epochs = int(config["train"].get("epochs", 10))
@@ -196,7 +205,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
-        epoch_loss_total = torch.zeros((), device=device)
+        epoch_log_totals: dict[str, torch.Tensor] = {}
         epoch_steps = 0
         start = time.perf_counter()
         for batch in tqdm(train_loader, desc=f"epoch {epoch}", leave=False):
@@ -211,16 +220,21 @@ def train(config: dict, resume_path: str | None = None) -> dict:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(config["train"]["grad_clip"]))
             scaler.step(optimizer)
             scaler.update()
-            epoch_loss_total += logs["loss"]
+            for key, value in logs.items():
+                epoch_log_totals[key] = epoch_log_totals.get(key, torch.zeros((), device=device)) + value
             epoch_steps += 1
 
         pred = predict_frame(model, valid_loader, device)
         metrics = compute_ranking_metrics(pred, topk=topk)
-        mean_train_loss = float((epoch_loss_total / max(epoch_steps, 1)).detach().cpu())
+        mean_logs = {
+            f"train_{key}": float((value / max(epoch_steps, 1)).detach().cpu())
+            for key, value in epoch_log_totals.items()
+        }
         record = {
             "epoch": epoch,
-            "train_loss": mean_train_loss,
+            "train_loss": mean_logs.get("train_loss", 0.0),
             "seconds": time.perf_counter() - start,
+            **mean_logs,
             **metrics,
         }
         history.append(record)
@@ -252,7 +266,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
         if improved:
             torch.save(checkpoint_payload, output_dir / "best.pt")
             pred.to_parquet(output_dir / "valid_predictions.parquet", index=False)
-        elif stale >= patience:
+        elif epoch >= min_epochs and stale >= patience:
             break
 
     write_json(

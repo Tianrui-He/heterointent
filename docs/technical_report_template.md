@@ -21,17 +21,29 @@ HeteroIntent-PLE contains:
 - Cross-domain Alignment: gated multimodal fusion + denoised co-occurrence item graph.
 - Multi-task Ranker: PLE with click, collect and share towers.
 
+When raw image/video files are unavailable, image and video modalities are
+represented by structured metadata from Qilin parquet fields, such as image
+count, image path buckets, video duration and resolution. Missing modality
+masks prevent all-zero modality features from receiving fusion gate mass.
+
 ## 4. Objective
 
 ```text
-L = 0.3 * BCE_click
-  + 0.4 * BCE_collect
-  + 0.3 * BCE_share
-  + 0.1 * BPR_weighted
-  + 0.05 * L_transition
-  + 0.05 * L_contrastive
-  + 1e-4 * L2
+L = 0.3 * BalancedFocalBCE_click
+  + 0.4 * BalancedFocalBCE_collect
+  + 0.3 * BalancedFocalBCE_share
+  + lambda_rank * BPR_weighted_score
+  + lambda_task_rank * BPR_click_collect_share
+  + lambda_intent * L_transition
+  + lambda_contrast * L_contrastive
 ```
+
+The balanced focal terms use stronger positive weights for sparse high-value
+behaviors such as collect and share. `BPR_weighted_score` aligns the final
+0.3/0.4/0.3 score with request-level ranking, while `BPR_click_collect_share`
+keeps each task tower independently rank-aware. The implementation uses bounded
+sampled BPR to preserve request-level ranking signal without exhaustive pair
+enumeration.
 
 Final ranking:
 

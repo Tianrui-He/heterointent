@@ -10,7 +10,27 @@ sys.path.insert(0, str(ROOT / "src"))
 import numpy as np
 import pandas as pd
 import torch
+import pyarrow.parquet as pq
 from tqdm import tqdm
+
+
+def _as_list(value: object) -> list:
+    if value is None:
+        return []
+    if isinstance(value, float) and np.isnan(value):
+        return []
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text == "[]":
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            return [part.strip().strip("'\"") for part in text[1:-1].split(",") if part.strip()]
+        return [text]
+    return []
 
 
 def find_image(image_root: Path, raw_item_id: int) -> Path | None:
@@ -22,9 +42,48 @@ def find_image(image_root: Path, raw_item_id: int) -> Path | None:
     return nested[0] if nested else None
 
 
+def find_image_from_paths(image_root: Path, image_paths: object) -> Path | None:
+    for rel in _as_list(image_paths):
+        rel_path = Path(str(rel).replace("\\", "/"))
+        candidates = [image_root / rel_path, image_root / rel_path.name]
+        for path in candidates:
+            if path.exists():
+                return path
+    return None
+
+
+def load_image_index(processed: Path, qilin_dir: Path | None, image_root: Path) -> pd.DataFrame:
+    item_map = pd.read_parquet(processed / "item_id_map.parquet").sort_values("item_id")
+    if qilin_dir is None:
+        rows = []
+        for row in item_map.itertuples(index=False):
+            path = find_image(image_root, int(row.raw_item_id))
+            if path is not None:
+                rows.append({"item_id": int(row.item_id), "raw_item_id": int(row.raw_item_id), "path": str(path)})
+        return pd.DataFrame(rows)
+
+    frames = []
+    for file in sorted((qilin_dir / "notes").glob("*.parquet")):
+        schema_cols = pq.ParquetFile(file).schema.names
+        cols = [col for col in ["note_idx", "image_path"] if col in schema_cols]
+        if set(cols) == {"note_idx", "image_path"}:
+            frames.append(pd.read_parquet(file, columns=cols))
+    notes = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["note_idx", "image_path"])
+    notes = item_map.merge(notes, left_on="raw_item_id", right_on="note_idx", how="left")
+    rows = []
+    for row in notes.itertuples(index=False):
+        path = find_image_from_paths(image_root, getattr(row, "image_path", None))
+        if path is None:
+            path = find_image(image_root, int(row.raw_item_id))
+        if path is not None:
+            rows.append({"item_id": int(row.item_id), "raw_item_id": int(row.raw_item_id), "path": str(path)})
+    return pd.DataFrame(rows)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build CLIP/SigLIP visual embeddings for processed Qilin items with local images.")
     parser.add_argument("--image-root", required=True, help="Directory containing local item images named by raw note id, for example 123.jpg.")
+    parser.add_argument("--qilin-dir", default=None, help="Optional raw Qilin directory. When provided, notes/image_path is used to find images under --image-root.")
     parser.add_argument("--processed-dir", default=str(ROOT / "data" / "processed" / "qilin_full"))
     parser.add_argument("--model-name", default="openai/clip-vit-base-patch32")
     parser.add_argument("--batch-size", type=int, default=32)
@@ -39,13 +98,8 @@ def main() -> None:
 
     processed = Path(args.processed_dir)
     image_root = Path(args.image_root)
-    item_map = pd.read_parquet(processed / "item_id_map.parquet").sort_values("item_id")
-    rows = []
-    for row in item_map.itertuples(index=False):
-        path = find_image(image_root, int(row.raw_item_id))
-        if path is not None:
-            rows.append({"item_id": int(row.item_id), "raw_item_id": int(row.raw_item_id), "path": str(path)})
-    items = pd.DataFrame(rows)
+    qilin_dir = Path(args.qilin_dir) if args.qilin_dir else None
+    items = load_image_index(processed, qilin_dir=qilin_dir, image_root=image_root)
     if items.empty:
         raise SystemExit(f"No images found under {image_root}. Check file names or pass the correct --image-root.")
 

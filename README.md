@@ -336,6 +336,47 @@ request_id, rank, item_id, score, p_click, p_collect, p_share
 - `scripts/evaluate.py`：验证/测试指标评估入口。
 - `scripts/infer.py`：Top-20 推理导出入口。
 
+## 多目标联合优化增强
+
+当前训练目标已经从单纯三任务 BCE/Focal BCE 扩展为更贴近 Top-20 精排的组合目标：
+
+```text
+L = 0.3 * BalancedFocalBCE_click
+  + 0.4 * BalancedFocalBCE_collect
+  + 0.3 * BalancedFocalBCE_share
+  + 0.03 * BPR_weighted_score
+  + 0.02 * BPR_per_task
+  + 0.03 * CE_type_transition
+  + 0.03 * CE_taxonomy_transition
+```
+
+其中 `BalancedFocalBCE` 支持对稀疏高价值行为设置正样本权重，当前默认：
+
+```yaml
+positive_weights:
+  click: 1.0
+  collect: 4.0
+  share: 6.0
+```
+
+`BPR_weighted_score` 直接约束最终 `0.3/0.4/0.3` 加权分数在同一 request 内把正样本排到负样本前面；`BPR_per_task` 分别约束 click、collect、share 三个 tower 的独立排序能力，避免 collect/share 信号完全被 click 主导。当前实现使用 bounded sampled BPR，默认每个 batch 每类 BPR 最多采样 64 个 request group、每组最多 32 对正负样本，避免辅助排序损失把训练时间拖到分钟级。训练日志会额外记录 `train_bce_click_loss`、`train_bce_collect_loss`、`train_bce_share_loss`、`train_bpr_loss` 和 `train_task_bpr_loss`，用于观察多目标优化是否失衡。
+
+## 多模态统一表征增强
+
+当前本地 Qilin 数据只有 parquet，没有真实图片/视频文件。因此项目先接入结构化多模态元信息：`scripts/prepare_qilin.py` 会从 notes 表的 `image_path`、`image_num`、`note_type`、`video_duration`、`video_height`、`video_width` 等字段生成 `image_feat_*` 和 `video_feat_*`，并写入 `metadata.json` 的 `image_dim` 与 `video_dim`。
+
+本实验使用独立 processed/output 目录，避免覆盖旧版 baseline：
+
+```powershell
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\prepare_qilin.py --qilin-dir data\raw\Qilin --output-dir data\processed\qilin_full_multimodal_meta --max-history 20 --text-hash-dim 0
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --model-name D:\models\Qwen2-0.5B --batch-size 64 --max-length 256 --device cuda
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\merge_embeddings.py --processed-dir data\processed\qilin_full_multimodal_meta --text
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_item_graph.py --processed-dir data\processed\qilin_full_multimodal_meta --embed-dim 64
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml
+```
+
+模型侧 `ItemEncoder` 会把 text、image-meta、video-meta、dense、graph、ID/类目特征分别投影到统一 `embed_dim` 空间，再通过 gate fusion 得到统一 item 表征。gate 已加入缺失模态 mask：当某个模态特征全 0 时，该模态不会参与 softmax 融合。当前 image/video 特征是 parquet 元信息，不是 CLIP/SigLIP 视觉像素 embedding；如果后续补齐真实 `image/part_xxx/...jpg` 文件，可继续使用 `scripts/build_visual_embeddings.py` 生成真实视觉向量并合并。
+
 ## 当前模型表现解读
 
 当前模型对点击目标排序较强，测试集 `HitClick@20` 达到 0.9936，`RecallClick@20` 达到 0.9161。收藏和分享在有正样本请求上的召回并不低：测试集 `RecallCollect@20` 为 0.8799，`RecallShare@20` 为 0.8164；但由于只有 5.11% 的测试请求存在收藏行为、1.90% 的测试请求存在分享行为，整体 Hit 指标仍然较低。
@@ -407,4 +448,3 @@ train:
 - `attention_target_mass`?DIN attention ?????????/????????????????
 
 ????????????????????????????????????????? `WeightedHit@20` ????????? `ranking_weighted_hit@20_shift` ????
-

@@ -25,8 +25,9 @@ NOTE_DENSE_COLUMNS = [
 ]
 
 USER_DENSE_COLUMNS = [f"dense_feat{i}" for i in range(1, 41)] + ["fans_num", "follows_num"]
-NOTE_COLUMNS = ["note_idx", "note_title", "note_content", "note_type", "taxonomy3_id", *NOTE_DENSE_COLUMNS]
+NOTE_COLUMNS = ["note_idx", "note_title", "note_content", "note_type", "taxonomy3_id", "image_path", *NOTE_DENSE_COLUMNS]
 USER_COLUMNS = ["user_idx", *USER_DENSE_COLUMNS]
+IMAGE_PATH_BUCKETS = 8
 
 
 def _read_parquet_dir(path: Path, columns: list[str] | None = None) -> pd.DataFrame:
@@ -70,11 +71,105 @@ def _as_list(value: object) -> list:
         return value.tolist()
     if isinstance(value, (list, tuple)):
         return list(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text == "[]":
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            return [part.strip().strip("'\"") for part in text[1:-1].split(",") if part.strip()]
+        return [text]
     return []
 
 
 def _as_details(details: object) -> Iterable[dict]:
     return _as_list(details)
+
+
+def _image_bucket_key(path: str) -> str:
+    parts = Path(path).parts
+    if len(parts) >= 2:
+        return parts[1]
+    return path
+
+
+def _resolution_features(note: pd.DataFrame) -> pd.DataFrame:
+    width = note["video_width"].fillna(0.0).clip(lower=0.0).astype("float32") if "video_width" in note else pd.Series(0.0, index=note.index)
+    height = note["video_height"].fillna(0.0).clip(lower=0.0).astype("float32") if "video_height" in note else pd.Series(0.0, index=note.index)
+    area = width * height
+    aspect = width / height.replace(0.0, np.nan)
+    aspect = aspect.replace([np.inf, -np.inf], 0.0).fillna(0.0).clip(0.0, 10.0)
+    return pd.DataFrame(
+        {
+            "video_width_log": np.log1p(width),
+            "video_height_log": np.log1p(height),
+            "video_area_log": np.log1p(area),
+            "video_aspect": aspect.astype("float32"),
+            "video_is_landscape": width.gt(height).astype("float32"),
+            "video_is_portrait": height.gt(width).astype("float32"),
+            "video_has_resolution": area.gt(0).astype("float32"),
+        },
+        index=note.index,
+    )
+
+
+def _image_path_lists(note: pd.DataFrame) -> list[list[str]]:
+    if "image_path" not in note.columns:
+        return [[] for _ in range(len(note))]
+    return [[str(path) for path in _as_list(value) if str(path)] for value in note["image_path"].tolist()]
+
+
+def build_image_meta_features(note: pd.DataFrame) -> pd.DataFrame:
+    """Build lightweight image metadata features from Qilin parquet columns."""
+
+    image_num = note["image_num"].fillna(0.0).clip(lower=0.0).astype("float32") if "image_num" in note else pd.Series(0.0, index=note.index)
+    path_lists = _image_path_lists(note)
+    path_count = pd.Series([len(paths) for paths in path_lists], index=note.index, dtype="float32")
+    bucket_values = np.zeros((len(note), IMAGE_PATH_BUCKETS), dtype="float32")
+    for row_idx, paths in enumerate(path_lists):
+        for path in paths:
+            bucket_values[row_idx, _stable_bucket(_image_bucket_key(path), IMAGE_PATH_BUCKETS) - 1] += 1.0
+    bucket_sums = bucket_values.sum(axis=1, keepdims=True)
+    bucket_values = np.divide(bucket_values, np.maximum(bucket_sums, 1.0), out=np.zeros_like(bucket_values), where=bucket_sums > 0)
+
+    base = pd.DataFrame(
+        {
+            "image_feat_0": np.log1p(image_num),
+            "image_feat_1": np.log1p(path_count),
+            "image_feat_2": image_num.gt(0).astype("float32"),
+            "image_feat_3": path_count.gt(1).astype("float32"),
+            "image_feat_4": (path_count - image_num).abs().astype("float32"),
+        },
+        index=note.index,
+    )
+    buckets = pd.DataFrame(bucket_values, columns=[f"image_feat_{5 + i}" for i in range(IMAGE_PATH_BUCKETS)], index=note.index)
+    return pd.concat([base, buckets], axis=1).astype("float32")
+
+
+def build_video_meta_features(note: pd.DataFrame) -> pd.DataFrame:
+    """Build lightweight video metadata features from Qilin parquet columns."""
+
+    note_type = note["note_type"].fillna(0.0).astype("float32") if "note_type" in note else pd.Series(0.0, index=note.index)
+    duration = note["video_duration"].fillna(0.0).clip(lower=0.0).astype("float32") if "video_duration" in note else pd.Series(0.0, index=note.index)
+    image_num = note["image_num"].fillna(0.0).clip(lower=0.0).astype("float32") if "image_num" in note else pd.Series(0.0, index=note.index)
+    resolution = _resolution_features(note)
+    values = pd.DataFrame(
+        {
+            "video_feat_0": note_type.eq(2).astype("float32"),
+            "video_feat_1": duration.gt(0).astype("float32"),
+            "video_feat_2": np.log1p(duration),
+            "video_feat_3": np.log1p(image_num),
+            "video_feat_4": duration.clip(0.0, 600.0) / 600.0,
+            "video_feat_5": resolution["video_width_log"],
+            "video_feat_6": resolution["video_height_log"],
+            "video_feat_7": resolution["video_area_log"],
+            "video_feat_8": resolution["video_aspect"],
+            "video_feat_9": resolution["video_is_landscape"],
+            "video_feat_10": resolution["video_is_portrait"],
+            "video_feat_11": resolution["video_has_resolution"],
+        },
+        index=note.index,
+    )
+    return values.astype("float32")
 
 
 def flatten_recommendation_frame(rec_df: pd.DataFrame, max_history: int = 20) -> pd.DataFrame:
@@ -135,6 +230,10 @@ def build_note_features(notes_df: pd.DataFrame, item_map: dict[int, int], text_h
         dense = note[dense_cols].fillna(0.0).astype("float32").reset_index(drop=True)
         dense.columns = [f"dense_feat_{i}" for i in range(dense.shape[1])]
         features = pd.concat([features, dense], axis=1)
+
+    image_meta = build_image_meta_features(note).reset_index(drop=True)
+    video_meta = build_video_meta_features(note).reset_index(drop=True)
+    features = pd.concat([features, image_meta, video_meta], axis=1)
 
     if text_hash_dim > 0:
         title = note["note_title"].fillna("") if "note_title" in note.columns else pd.Series("", index=note.index)
@@ -230,4 +329,3 @@ def convert_qilin_directory(qilin_dir: str | Path, output_dir: str | Path, max_h
     _save_mappings(output_dir, item_map, user_map, taxonomy_map)
     write_json({"num_raw_items": len(item_map), "num_raw_users": len(user_map), "num_taxonomies": len(taxonomy_map), "train_rows": len(train), "valid_rows": len(valid), "test_rows": len(test_flat)}, output_dir / "id_mapping_summary.json")
     return metadata
-

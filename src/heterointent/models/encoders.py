@@ -31,6 +31,9 @@ class ItemEncoder(nn.Module):
         gate_inputs = embed_dim * (4 + len(self.projections) + int(use_graph_embedding))
         self.gate = nn.Linear(gate_inputs, 4 + len(self.projections) + int(use_graph_embedding))
         self.output = nn.Sequential(nn.LayerNorm(embed_dim), nn.Dropout(dropout))
+        self.part_names = ["item_id", "item_type", "taxonomy", "position", *self.projections.keys()]
+        if use_graph_embedding:
+            self.part_names.append("graph")
 
     def set_graph_trainable(self, trainable: bool) -> None:
         self.graph_embedding.weight.requires_grad_(trainable)
@@ -52,10 +55,12 @@ class ItemEncoder(nn.Module):
             self.taxonomy_embedding(batch["taxonomy_id"]),
             self.position_embedding(position),
         ]
+        presence_masks = [torch.ones_like(batch["item_id"], dtype=torch.bool) for _ in parts]
         text_repr = None
         image_repr = None
         for name, projection in self.projections.items():
             feat = batch[f"{name}_feat"].float()
+            presence_masks.append(feat.abs().sum(dim=-1).gt(0))
             if feat.is_cuda:
                 with torch.amp.autocast("cuda", enabled=False):
                     repr_ = projection(feat)
@@ -68,12 +73,16 @@ class ItemEncoder(nn.Module):
             parts.append(repr_)
         if self.use_graph_embedding:
             parts.append(self.graph_embedding(batch["item_id"]))
+            presence_masks.append(batch["item_id"].gt(0))
         gate_logits = self.gate(torch.cat(parts, dim=-1))
+        modality_mask = torch.stack(presence_masks, dim=-1)
+        gate_logits = gate_logits.masked_fill(~modality_mask, torch.finfo(gate_logits.dtype).min)
         weights = torch.softmax(gate_logits, dim=-1)
         stacked = torch.stack(parts, dim=1)
         fused = (stacked * weights.unsqueeze(-1)).sum(dim=1)
         extras = {
             "modality_gate": weights,
+            "modality_gate_mask": modality_mask.float(),
             "item_id_repr": parts[0],
             "text_repr": text_repr if text_repr is not None else torch.zeros_like(fused),
             "image_repr": image_repr if image_repr is not None else torch.zeros_like(fused),

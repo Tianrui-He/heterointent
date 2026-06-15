@@ -61,6 +61,7 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
     df = deduplicate_request_items(df)
     duplicate_rows_removed = raw_rows - len(df)
     has_dynamic = {"has_intent_target", "is_type_shift", "is_taxonomy_shift"}.issubset(df.columns)
+    gate_cols = sorted(col for col in df.columns if col.startswith("gate_"))
 
     per_request = []
     for _, group in df.groupby("request_id", sort=False):
@@ -91,6 +92,8 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
             row[f"recall_{task}_overall@20"] = recall if has_positive else 0.0
             row[f"has_{task}_positive"] = float(has_positive)
         row["weighted_hit@20"] = sum(TASK_WEIGHTS[t] * row[f"hit_{t}@20"] for t in TASKS)
+        for col in gate_cols:
+            row[f"top20_mean_{col}"] = float(ranked[col].mean())
 
         if has_dynamic:
             has_target = float(first.get("has_intent_target", 0)) > 0
@@ -136,6 +139,8 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
             metrics[f"auc_{task}"] = _safe_auc(df[task].to_numpy(), df[score_col].to_numpy())
         metrics[f"positive_requests_{task}"] = float(df.groupby("request_id")[task].sum().gt(0).sum())
         metrics[f"positive_request_rate_{task}"] = float(metrics[f"has_{task}_positive"])
+    for col in gate_cols:
+        metrics[f"mean_{col}"] = float(df[col].mean())
 
     if has_dynamic:
         target_requests = per_request_df[per_request_df["has_intent_target"].gt(0)]
