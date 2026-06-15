@@ -1,117 +1,147 @@
-# HeteroIntent-PLE：赛题二多源异构多目标推荐精排系统
+# HeteroIntent-PLE
 
-本项目面向“2026 年中国研究生人工智能创新大赛华为赛题二：面向多源异构内容的用户意图感知与多目标推荐排序优化”。当前版本已经接入全量 Qilin 数据，完成数据转换、文本 embedding 合并、item graph 构建、训练、验证、测试和 Top-20 推理导出。
-
-模型目标是对同一推荐请求下的每个候选 item 预测：
+面向 Qilin 多源异构内容推荐的精排系统。模型对同一 `request_id` 下的候选 item 同时预测：
 
 ```text
 p_click, p_collect, p_share
 ```
 
-最终排序分数固定为：
+最终排序分数为：
 
 ```text
 score = 0.3 * p_click + 0.4 * p_collect + 0.3 * p_share
 ```
 
-项目内部训练表是“一行 = 一个 request 下的一个候选 item”。推理时会按 `request_id` 分组排序，输出每个请求下得分最高的 Top-20 item。当前导出逻辑已经对同一 `request_id + item_id` 去重，同一请求不会重复推荐同一个物品。
+当前主线版本是 **大 PLE 多目标模型 + parquet 元信息多模态统一表征**。由于本地没有真实图片/视频文件，图像和视频模态暂时来自 Qilin `notes` 表中的结构化元信息，例如 `image_path`、`image_num`、`note_type`、`video_duration`、`video_height`、`video_width`。
 
-## 当前最终结果
+## 当前版本
 
-最终 checkpoint：
+| 项目 | 路径或数值 |
+| --- | --- |
+| 配置文件 | `configs/qilin_full.yaml` |
+| 处理后数据 | `data/processed/qilin_full_multimodal_meta` |
+| 训练输出 | `outputs/qilin_full_multimodal_meta` |
+| 最优 checkpoint | `outputs/qilin_full_multimodal_meta/best.pt` |
+| Top-20 文件 | `outputs/qilin_full_multimodal_meta/submission_top20_dedup.csv` |
+| 参数量 | 155,110,672 |
+| 最佳验证轮次 | epoch 4 |
+| 完成训练轮数 | 12 |
 
-```text
-outputs/qilin_full/best.pt
+当前配置要点：
+
+```yaml
+model:
+  hidden_dim: 512
+  shared_experts: 8
+  task_experts: 4
+  ple_layers: 3
+
+loss:
+  bpr_weight: 0.01
+  task_bpr_weight: 0.005
+  contrastive_weight: 0.0
+
+data:
+  processed_dir: data/processed/qilin_full_multimodal_meta
+
+train:
+  output_dir: outputs/qilin_full_multimodal_meta
 ```
 
-最终提交/推理文件：
+## 最新指标
+
+验证集最佳结果来自 `outputs/qilin_full_multimodal_meta/metrics.csv` 的第 4 轮。
+
+| 指标 | Valid | Test |
+| --- | ---: | ---: |
+| WeightedHit@20 | 0.242119 | 0.321044 |
+| NDCG@20 | 0.520923 | 0.674518 |
+| HitClick@20 | 0.755382 | 0.992803 |
+| HitCollect@20 | 0.029133 | 0.046064 |
+| HitShare@20 | 0.012838 | 0.015924 |
+| AUC Click | 0.680019 | 0.696142 |
+| AUC Collect | 0.817309 | 0.800443 |
+| AUC Share | 0.682769 | 0.675038 |
+
+与原始 `outputs/qilin_full` baseline 相比，当前多模态元信息版在测试集上：
+
+| 指标 | 变化 |
+| --- | ---: |
+| WeightedHit@20 | -0.000234 |
+| NDCG@20 | +0.019684 |
+| HitCollect@20 | +0.000090 |
+| AUC Click | +0.037177 |
+| AUC Share | +0.013644 |
+
+结论：当前多模态元信息主要改善排序位置质量和部分 AUC，尚未带来主指标 `WeightedHit@20` 的提升。真实图片/视频 embedding 缺失是主要限制。
+
+## 模型设计
+
+### 1. 多模态统一表征
+
+`scripts/prepare_qilin.py` 会在 Qilin 转换阶段生成：
+
+- `image_feat_*`：由 `image_num`、`image_path` 数量、是否多图、路径 hash bucket 等元信息构成。
+- `video_feat_*`：由 `note_type`、视频时长、分辨率、面积、宽高比、是否横屏/竖屏等元信息构成。
+- `dense_feat_*`：保留原始统计特征，不破坏 baseline。
+
+`ItemEncoder` 会把 item ID、类目、位置、text、image-meta、video-meta、dense、graph 分别投影到统一向量空间，再通过 gate fusion 得到 item 表征。缺失模态会被 mask 掉，特征全 0 的 image/video 不参与 softmax 融合。
+
+评估输出中会统计 `mean_gate_*` 和 `top20_mean_gate_*`。最近一次测试集中 Top-20 平均 gate 大致为：
+
+| 模态 | Top-20 gate |
+| --- | ---: |
+| graph | 0.504662 |
+| dense | 0.238981 |
+| text | 0.076525 |
+| video-meta | 0.061091 |
+| image-meta | 0.036860 |
+
+### 2. 动态意图理解
+
+数据转换阶段会基于历史 item 类型和类目生成动态意图字段，例如：
 
 ```text
-outputs/qilin_full/submission_top20_dedup.csv
+target_item_type, target_taxonomy_id,
+hist_dominant_item_type, hist_dominant_taxonomy_id,
+is_type_shift, is_taxonomy_shift, has_intent_target,
+hist_item_type_*, hist_taxonomy_id_*
 ```
 
-最终指标记录：
+模型通过 `type_transition_head` 和 `taxonomy_transition_head` 预测用户意图转移。当前配置中：
+
+```yaml
+type_transition_weight: 0.03
+taxonomy_transition_weight: 0.03
+```
+
+### 3. 多目标联合优化
+
+训练目标由三任务 BCE/Focal BCE、加权排序 BPR、分任务 BPR 和动态意图辅助损失组成：
 
 ```text
-outputs/qilin_full/final_eval_metrics.json
+L = task BCE/Focal
+  + bpr_weight * request-level weighted BPR
+  + task_bpr_weight * per-task BPR
+  + type_transition_weight * CE(type)
+  + taxonomy_transition_weight * CE(taxonomy)
 ```
 
-训练概况：
+当前 collect/share 是稀疏高价值行为，因此配置中保留正样本加权：
 
-| 项目 | 数值 |
-| --- | ---: |
-| 最后训练轮数 | 10 |
-| 最佳验证轮数 | 5 |
-| 模型参数量 | 122,767,046 |
-| 训练设备 | cuda |
-| 最佳验证 WeightedHit@20 | 0.242119 |
-
-验证集结果：
-
-> Recall 指标当前采用标准口径：只在该行为有正样本的请求上取平均；旧的全请求平均值保存在 `final_eval_metrics.json` 的 `*_overall@20` 字段中。
-
-| 指标 | 数值 |
-| --- | ---: |
-| WeightedHit@20 | 0.242119 |
-| NDCG@20 | 0.505449 |
-| HitClick@20 | 0.756172 |
-| RecallClick@20 | 0.932421 |
-| HitCollect@20 | 0.028540 |
-| RecallCollect@20 | 0.904946 |
-| HitShare@20 | 0.012838 |
-| RecallShare@20 | 0.899767 |
-| AUC Click | 0.658068 |
-| AUC Collect | 0.845413 |
-| AUC Share | 0.646035 |
-| 请求数 | 10,126 |
-| 去重后样本行数 | 122,123 |
-| 移除重复候选行数 | 3,464 |
-
-测试集结果：
-
-| 指标 | 数值 |
-| --- | ---: |
-| WeightedHit@20 | 0.321278 |
-| NDCG@20 | 0.654834 |
-| HitClick@20 | 0.993612 |
-| RecallClick@20 | 0.916099 |
-| HitCollect@20 | 0.045974 |
-| RecallCollect@20 | 0.879879 |
-| HitShare@20 | 0.016014 |
-| RecallShare@20 | 0.816407 |
-| AUC Click | 0.658965 |
-| AUC Collect | 0.815774 |
-| AUC Share | 0.661394 |
-| 请求数 | 11,115 |
-| 去重后样本行数 | 179,401 |
-| 移除重复候选行数 | 3,166 |
-
-提交文件检查：
-
-| 项目 | 数值 |
-| --- | ---: |
-| 输出行数 | 123,474 |
-| 请求数 | 11,115 |
-| 重复 request-item pair | 0 |
-| rank 不连续请求数 | 0 |
-| 输出 20 个 item 的请求数 | 2,963 |
-| 少于 20 个 item 的请求数 | 8,152 |
-
-说明：有不少请求少于 20 个 item，是因为候选池去重后本身不足 20 个唯一 item。当前项目按“给定候选池精排”处理，不额外召回热门 item 补齐。
+```yaml
+positive_weights:
+  click: 1.0
+  collect: 4.0
+  share: 3.0
+```
 
 ## 环境
 
 推荐使用已经验证可用的 Conda CUDA 环境：
 
-```text
+```powershell
 D:\adaconda3\envs\MiniOneRec-pre\python.exe
-```
-
-该环境已验证可识别：
-
-```text
-NVIDIA GeForce RTX 5070
-PyTorch CUDA 12.8
 ```
 
 检查 GPU：
@@ -120,21 +150,24 @@ PyTorch CUDA 12.8
 D:\adaconda3\envs\MiniOneRec-pre\python.exe -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
 ```
 
-不要使用项目 `.venv` 训练全量模型，因为 `.venv` 中可能是 CPU 版 PyTorch。
+不要使用项目 `.venv` 跑全量训练，因为其中可能是 CPU 版 PyTorch。
 
-## 目录结构
+## 数据目录
+
+原始 Qilin 数据应放在：
 
 ```text
-configs/
-  qilin_full.yaml
-
 data/raw/Qilin/
-  recommendation_train/
-  recommendation_test/
-  notes/
-  user_feat/
+  recommendation_train/*.parquet
+  recommendation_test/*.parquet
+  notes/*.parquet
+  user_feat/*.parquet
+```
 
-data/processed/qilin_full/
+当前主线 processed 目录：
+
+```text
+data/processed/qilin_full_multimodal_meta/
   train.parquet
   valid.parquet
   test.parquet
@@ -146,128 +179,70 @@ data/processed/qilin_full/
   text_embedding_item_ids.npy
   text_embedding_items.parquet
   graph_embedding.npy
-
-outputs/qilin_full/
-  best.pt
-  last.pt
-  metrics.csv
-  summary.json
-  valid_predictions.parquet
-  final_eval_metrics.json
-  submission_top20_dedup.csv
-
-scripts/
-  prepare_qilin.py
-  build_text_embeddings.py
-  build_visual_embeddings.py
-  merge_embeddings.py
-  build_item_graph.py
-  train.py
-  evaluate.py
-  infer.py
-
-src/heterointent/
-  data/
-  models/
-  training/
-  evaluation/
-  inference/
 ```
 
-## 完整操作流程
+## 运行流程
 
-以下命令均在项目根目录运行：
+以下命令均在项目根目录执行：
 
 ```powershell
 cd C:\Users\31278\Desktop\heterointent
 ```
 
-### 1. 准备 Qilin 原始数据
-
-原始数据目录应为：
-
-```text
-data/raw/Qilin/
-  recommendation_train/*.parquet
-  recommendation_test/*.parquet
-  notes/*.parquet
-  user_feat/*.parquet
-```
-
-### 2. 转换 Qilin 数据
+### 1. 转换 Qilin 数据
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\prepare_qilin.py --qilin-dir data\raw\Qilin --output-dir data\processed\qilin_full --max-history 20 --text-hash-dim 0
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\prepare_qilin.py --qilin-dir data\raw\Qilin --output-dir data\processed\qilin_full_multimodal_meta --max-history 20 --text-hash-dim 0
 ```
 
-这一步会展开 Qilin 的候选列表，生成一行一个候选 item 的训练表，并创建连续 ID 映射。
-
-### 3. 生成文本 embedding
-
-当前项目使用本地 Qwen2-0.5B 生成文本向量，路径示例：
+### 2. 生成文本 embedding
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full --model-name D:\models\Qwen2-0.5B --batch-size 64 --max-length 256 --device cuda
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --model-name D:\models\Qwen2-0.5B --batch-size 64 --max-length 256 --device cuda
 ```
 
-也可以替换为更适合检索的 embedding 模型，例如 BGE：
+这一阶段需要为约 94.6 万个 item 生成文本向量，耗时明显长于单轮训练是正常现象。后续可替换为更适合 embedding 的中文模型，例如：
 
 ```powershell
 --model-name D:\models\bge-small-zh-v1.5
 ```
 
-### 4. 合并文本 embedding
+### 3. 合并文本 embedding
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\merge_embeddings.py --processed-dir data\processed\qilin_full --text
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\merge_embeddings.py --processed-dir data\processed\qilin_full_multimodal_meta --text
 ```
 
-### 5. 构建 item graph
+### 4. 构建 item graph
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_item_graph.py --processed-dir data\processed\qilin_full --embed-dim 64
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_item_graph.py --processed-dir data\processed\qilin_full_multimodal_meta --embed-dim 64
 ```
 
-### 6. 训练
-
-从头训练：
+### 5. 训练
 
 ```powershell
 D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml
 ```
 
-从断点继续训练：
+断点续训：
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml --resume outputs\qilin_full\last.pt
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml --resume outputs\qilin_full_multimodal_meta\last.pt
 ```
 
-当前配置使用：
-
-```yaml
-device: cuda
-batch_size: 2048
-amp: true
-fast_loader: true
-output_dir: outputs/qilin_full
-```
-
-### 7. 验证集评估
+### 6. 验证和测试
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\evaluate.py --checkpoint outputs\qilin_full\best.pt --samples data\processed\qilin_full\valid.parquet --device cuda --batch-size 2048
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\evaluate.py --checkpoint outputs\qilin_full_multimodal_meta\best.pt --samples data\processed\qilin_full_multimodal_meta\valid.parquet --device cuda --batch-size 2048
+
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\evaluate.py --checkpoint outputs\qilin_full_multimodal_meta\best.pt --samples data\processed\qilin_full_multimodal_meta\test.parquet --device cuda --batch-size 2048
 ```
 
-### 8. 测试集评估
+### 7. 导出 Top-20
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\evaluate.py --checkpoint outputs\qilin_full\best.pt --samples data\processed\qilin_full\test.parquet --device cuda --batch-size 2048
-```
-
-### 9. 导出 Top-20
-
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\infer.py --checkpoint outputs\qilin_full\best.pt --samples data\processed\qilin_full\test.parquet --output outputs\qilin_full\submission_top20_dedup.csv --device cuda --batch-size 2048
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\infer.py --checkpoint outputs\qilin_full_multimodal_meta\best.pt --samples data\processed\qilin_full_multimodal_meta\test.parquet --output outputs\qilin_full_multimodal_meta\submission_top20_dedup.csv --device cuda --batch-size 2048
 ```
 
 输出字段：
@@ -276,175 +251,32 @@ D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\infer.py --checkpoint output
 request_id, rank, item_id, score, p_click, p_collect, p_share
 ```
 
-## 指标含义
+## 常用脚本
 
-- `p_click`：模型预测候选 item 被点击的概率。
-- `p_collect`：模型预测候选 item 被收藏的概率。
-- `p_share`：模型预测候选 item 被分享的概率。
-- `score`：最终排序分数，等于 `0.3*p_click + 0.4*p_collect + 0.3*p_share`。
-- `HitClick@20`：每个请求的 Top-20 中是否命中至少一个点击正样本，然后对请求取平均。
-- `HitCollect@20`：每个请求的 Top-20 中是否命中至少一个收藏正样本，然后对请求取平均。
-- `HitShare@20`：每个请求的 Top-20 中是否命中至少一个分享正样本，然后对请求取平均。
-- `RecallClick@20`：只在有点击正样本的请求上计算，等于 Top-20 命中的点击正样本数 / 该请求全部点击正样本数。
-- `RecallCollect@20`：只在有收藏正样本的请求上计算；没有收藏行为的请求不参与该平均值。
-- `RecallShare@20`：只在有分享正样本的请求上计算；没有分享行为的请求不参与该平均值。
-- `RecallClick/Collect/Share_overall@20`：旧口径，把没有对应正样本的请求按 0 计入平均，用于观察行为稀疏性对整体数值的稀释。
+| 脚本 | 作用 |
+| --- | --- |
+| `scripts/prepare_qilin.py` | 转换 Qilin parquet，生成训练/验证/测试表和 metadata |
+| `scripts/build_text_embeddings.py` | 生成离线文本 embedding |
+| `scripts/merge_embeddings.py` | 合并文本或视觉 embedding 到样本表 |
+| `scripts/build_item_graph.py` | 构建 item graph embedding |
+| `scripts/build_visual_embeddings.py` | 预留真实图片 embedding 入口 |
+| `scripts/train.py` | 训练或断点续训 |
+| `scripts/evaluate.py` | 验证/测试评估 |
+| `scripts/infer.py` | 导出 Top-20 推荐结果 |
+
+## 指标说明
+
 - `WeightedHit@20`：主指标近似值，等于 `0.3*HitClick@20 + 0.4*HitCollect@20 + 0.3*HitShare@20`。
-- `NDCG@20`：考虑排序位置的加权相关性指标，越靠前命中高价值行为得分越高。
-- `AUC Click/Collect/Share`：三类二分类任务的排序区分能力。
-- `num_rows_after_dedup`：按 `request_id + item_id` 去重后的评估行数。
-- `num_duplicate_rows_removed`：评估前移除的重复候选行数。
+- `NDCG@20`：考虑排序位置的加权相关性指标。
+- `HitClick/Collect/Share@20`：Top-20 中是否命中对应行为正样本，并对请求取平均。
+- `RecallClick/Collect/Share@20`：只在有对应正样本的请求上计算召回。
+- `AUC Click/Collect/Share`：三类二分类任务的区分能力。
+- `mean_gate_*`：所有候选样本上的平均模态 gate 权重。
+- `top20_mean_gate_*`：Top-20 候选上的平均模态 gate 权重。
 
-## 文件含义
+## 后续优化方向
 
-### 配置
-
-- `configs/qilin_full.yaml`：唯一保留的最终训练配置，控制数据路径、模型结构、训练参数、输出目录。
-
-### 数据
-
-- `data/raw/Qilin/`：官方 Qilin 原始 parquet 数据，不应修改。
-- `data/processed/qilin_full/train.parquet`：训练集，一行一个候选 item。
-- `data/processed/qilin_full/valid.parquet`：验证集。
-- `data/processed/qilin_full/test.parquet`：测试集。
-- `data/processed/qilin_full/metadata.json`：模型需要的数据规模和特征维度。
-- `data/processed/qilin_full/item_id_map.parquet`：原始 `note_idx` 到连续 `item_id` 的映射。
-- `data/processed/qilin_full/user_id_map.parquet`：原始 `user_idx` 到连续 `user_id` 的映射。
-- `data/processed/qilin_full/taxonomy_id_map.parquet`：类目到连续 `taxonomy_id` 的映射。
-- `data/processed/qilin_full/text_embeddings.npy`：离线文本 embedding 矩阵。
-- `data/processed/qilin_full/text_embedding_item_ids.npy`：文本 embedding 对应的 `item_id`。
-- `data/processed/qilin_full/graph_embedding.npy`：item 共现图生成的图增强 embedding。
-
-### 输出
-
-- `outputs/qilin_full/best.pt`：验证集 WeightedHit@20 最优 checkpoint，用于最终评估和推理。
-- `outputs/qilin_full/last.pt`：最后一轮 checkpoint，用于断点续训。
-- `outputs/qilin_full/metrics.csv`：每轮训练 loss 和验证指标。
-- `outputs/qilin_full/summary.json`：训练摘要，包括最佳指标、参数量、训练设备和最后轮数。
-- `outputs/qilin_full/valid_predictions.parquet`：最佳模型在验证集上的逐候选预测结果。
-- `outputs/qilin_full/final_eval_metrics.json`：本次最终验证集和测试集指标汇总。
-- `outputs/qilin_full/submission_top20_dedup.csv`：最终 Top-20 推荐结果，已去重。
-
-### 脚本
-
-- `scripts/prepare_qilin.py`：官方 Qilin 数据转换。
-- `scripts/build_text_embeddings.py`：生成文本 embedding。
-- `scripts/build_visual_embeddings.py`：可选，生成视觉 embedding。
-- `scripts/merge_embeddings.py`：把离线 embedding 合并进训练表。
-- `scripts/build_item_graph.py`：构建 item graph embedding。
-- `scripts/train.py`：训练和断点续训入口。
-- `scripts/evaluate.py`：验证/测试指标评估入口。
-- `scripts/infer.py`：Top-20 推理导出入口。
-
-## 多目标联合优化增强
-
-当前训练目标已经从单纯三任务 BCE/Focal BCE 扩展为更贴近 Top-20 精排的组合目标：
-
-```text
-L = 0.3 * BalancedFocalBCE_click
-  + 0.4 * BalancedFocalBCE_collect
-  + 0.3 * BalancedFocalBCE_share
-  + 0.03 * BPR_weighted_score
-  + 0.02 * BPR_per_task
-  + 0.03 * CE_type_transition
-  + 0.03 * CE_taxonomy_transition
-```
-
-其中 `BalancedFocalBCE` 支持对稀疏高价值行为设置正样本权重，当前默认：
-
-```yaml
-positive_weights:
-  click: 1.0
-  collect: 4.0
-  share: 6.0
-```
-
-`BPR_weighted_score` 直接约束最终 `0.3/0.4/0.3` 加权分数在同一 request 内把正样本排到负样本前面；`BPR_per_task` 分别约束 click、collect、share 三个 tower 的独立排序能力，避免 collect/share 信号完全被 click 主导。当前实现使用 bounded sampled BPR，默认每个 batch 每类 BPR 最多采样 64 个 request group、每组最多 32 对正负样本，避免辅助排序损失把训练时间拖到分钟级。训练日志会额外记录 `train_bce_click_loss`、`train_bce_collect_loss`、`train_bce_share_loss`、`train_bpr_loss` 和 `train_task_bpr_loss`，用于观察多目标优化是否失衡。
-
-## 多模态统一表征增强
-
-当前本地 Qilin 数据只有 parquet，没有真实图片/视频文件。因此项目先接入结构化多模态元信息：`scripts/prepare_qilin.py` 会从 notes 表的 `image_path`、`image_num`、`note_type`、`video_duration`、`video_height`、`video_width` 等字段生成 `image_feat_*` 和 `video_feat_*`，并写入 `metadata.json` 的 `image_dim` 与 `video_dim`。
-
-本实验使用独立 processed/output 目录，避免覆盖旧版 baseline：
-
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\prepare_qilin.py --qilin-dir data\raw\Qilin --output-dir data\processed\qilin_full_multimodal_meta --max-history 20 --text-hash-dim 0
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --model-name D:\models\Qwen2-0.5B --batch-size 64 --max-length 256 --device cuda
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\merge_embeddings.py --processed-dir data\processed\qilin_full_multimodal_meta --text
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_item_graph.py --processed-dir data\processed\qilin_full_multimodal_meta --embed-dim 64
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml
-```
-
-模型侧 `ItemEncoder` 会把 text、image-meta、video-meta、dense、graph、ID/类目特征分别投影到统一 `embed_dim` 空间，再通过 gate fusion 得到统一 item 表征。gate 已加入缺失模态 mask：当某个模态特征全 0 时，该模态不会参与 softmax 融合。当前 image/video 特征是 parquet 元信息，不是 CLIP/SigLIP 视觉像素 embedding；如果后续补齐真实 `image/part_xxx/...jpg` 文件，可继续使用 `scripts/build_visual_embeddings.py` 生成真实视觉向量并合并。
-
-## 当前模型表现解读
-
-当前模型对点击目标排序较强，测试集 `HitClick@20` 达到 0.9936，`RecallClick@20` 达到 0.9161。收藏和分享在有正样本请求上的召回并不低：测试集 `RecallCollect@20` 为 0.8799，`RecallShare@20` 为 0.8164；但由于只有 5.11% 的测试请求存在收藏行为、1.90% 的测试请求存在分享行为，整体 Hit 指标仍然较低。
-
-后续如果继续追求效果，可以优先尝试：
-
-1. 使用更适合 embedding 的中文模型，如 `bge-small-zh-v1.5` 或 `bge-base-zh-v1.5`。
-2. 对 collect/share 做更强的样本重加权或 focal 参数调优。
-3. 恢复部分辅助损失并观察速度与效果的折中。
-4. 增加视觉特征或更强的 item graph 去噪。
-
-## ?????????
-
-????????????????? + ???????????? `outputs/qilin_full` checkpoint ????? baseline?????????? `type_transition_head` ? `taxonomy_transition_head`????????????????
-
-```text
-outputs/qilin_full_dynamic/
-```
-
-### 1. ????????
-
-????? `data/processed/qilin_full`?????
-
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\annotate_dynamic_intent.py --processed-dir data\processed\qilin_full --qilin-dir data\raw\Qilin --max-history 20
-```
-
-?????? processed ???????? `data/raw/Qilin`???? `train.parquet`?`valid.parquet`?`test.parquet` ???
-
-```text
-target_item_type, target_taxonomy_id,
-hist_dominant_item_type, hist_dominant_taxonomy_id,
-is_type_shift, is_taxonomy_shift, has_intent_target,
-hist_item_type_0..19, hist_taxonomy_id_0..19
-```
-
-??????? `scripts/prepare_qilin.py`?????????????????????
-
-### 2. ??????????
-
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml
-```
-
-??????????
-
-```yaml
-loss:
-  type_transition_weight: 0.03
-  taxonomy_transition_weight: 0.03
-
-train:
-  output_dir: outputs/qilin_full_dynamic
-```
-
-???????? `outputs/qilin_full/last.pt` ????????????????????????????????????????? checkpoint?
-
-### 3. ????????
-
-- `intent_type_acc@1`?????? Top-1 ????????????????? item ? `item_type`?
-- `intent_type_acc@2`?Top-2 ?????????????
-- `intent_taxonomy_acc@1`?Top-1 ????????????? item ? `taxonomy_id`?
-- `intent_taxonomy_acc@5`?Top-5 ?????????????
-- `intent_taxonomy_mrr`??????????????????????????
-- `shift_type_hit@1`??????????????? `intent_type_acc@1`?
-- `shift_taxonomy_hit@5`??????????????? `intent_taxonomy_acc@5`?
-- `ranking_weighted_hit@20_shift`?????????????????????
-- `ranking_weighted_hit@20_stable`??????????????????
-- `attention_target_mass`?DIN attention ?????????/????????????????
-
-????????????????????????????????????????? `WeightedHit@20` ????????? `ranking_weighted_hit@20_shift` ????
+1. 接入真实图片文件后，用 `scripts/build_visual_embeddings.py` 生成 CLIP/SigLIP 图像 embedding，再与当前 image metadata 拼接或替换。
+2. 将文本 embedding 模型从 Qwen2-0.5B 替换为更适合检索的 BGE/E5 类模型，比较 NDCG 和 AUC。
+3. 对 collect/share 做更细的采样和重加权实验，重点观察 HitCollect@20、HitShare@20 与 WeightedHit@20 的权衡。
+4. 对 item graph 做去噪或按行为类型加权，避免 graph gate 过强时压制 image/video/text 的增量贡献。
