@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from heterointent.data.dynamic_intent import annotate_dynamic_intents, build_item_intent_lookups
 from heterointent.data.io import write_table
 from heterointent.utils import write_json
 
@@ -98,6 +99,16 @@ def make_synthetic_dataset(
         histories[user_id].extend(positives[:3] or [int(candidates[0])])
 
     df = pd.DataFrame(rows).sort_values(["timestamp", "request_id", "position"]).reset_index(drop=True)
+    item_features = pd.DataFrame(
+        {
+            "item_id": np.arange(num_items + 1),
+            "item_type": item_type,
+            "taxonomy_id": taxonomy,
+        }
+    )
+    type_lookup, taxonomy_lookup = build_item_intent_lookups(item_features)
+    df = annotate_dynamic_intents(df, type_lookup, taxonomy_lookup, max_history=max_history)
+
     n = len(df)
     train = df.iloc[: int(n * 0.8)]
     valid = df.iloc[int(n * 0.8) : int(n * 0.9)]
@@ -117,6 +128,7 @@ def make_synthetic_dataset(
         "video_dim": video_dim,
         "dense_dim": dense_dim,
         "max_history": max_history,
+        "dynamic_intent": True,
     }
     write_json(metadata, output_dir / "metadata.json")
     return metadata

@@ -34,6 +34,8 @@ loss:
   share_weight: 0.3
   bpr_weight: 0.0
   transition_weight: 0.0
+  type_transition_weight: 0.03
+  taxonomy_transition_weight: 0.03
   contrastive_weight: 0.0
   l2_weight: 0.0001
   focal_gamma: 1.5
@@ -45,10 +47,11 @@ train:
   grad_clip: 5.0
   patience: 5
   amp: true
-  output_dir: outputs/qilin_full
+  output_dir: outputs/qilin_full_dynamic
 
 evaluation:
   topk: 20
+  enable_dynamic_intent_metrics: true
   score_weights:
     click: 0.3
     collect: 0.4

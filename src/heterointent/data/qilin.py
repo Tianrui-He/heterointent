@@ -10,6 +10,7 @@ import pandas as pd
 import pyarrow.parquet as pq
 
 from heterointent.data.io import write_table
+from heterointent.data.dynamic_intent import annotate_dynamic_intents, build_item_intent_lookups
 from heterointent.data.preprocess import infer_metadata
 from heterointent.utils import write_json
 
@@ -211,6 +212,11 @@ def convert_qilin_directory(qilin_dir: str | Path, output_dir: str | Path, max_h
     test_flat["taxonomy_id"] = test_flat["taxonomy_key"].map(taxonomy_map).fillna(0).astype(int)
     train_flat = train_flat.drop(columns=["taxonomy_key"])
     test_flat = test_flat.drop(columns=["taxonomy_key"])
+
+    notes["taxonomy_id"] = notes["taxonomy_key"].map(taxonomy_map).fillna(0).astype(int)
+    item_type_lookup, item_taxonomy_lookup = build_item_intent_lookups(notes[["item_id", "item_type", "taxonomy_id"]])
+    train_flat = annotate_dynamic_intents(train_flat, item_type_lookup, item_taxonomy_lookup, max_history=max_history)
+    test_flat = annotate_dynamic_intents(test_flat, item_type_lookup, item_taxonomy_lookup, max_history=max_history)
 
     train_flat = train_flat.sort_values(["timestamp", "request_id", "position"]).reset_index(drop=True)
     split = int(len(train_flat) * 0.9)

@@ -22,14 +22,21 @@ def test_synthetic_training_smoke() -> None:
         dense_dim=6,
         seed=7,
     )
-    cfg = load_config("configs/smoke.yaml")
+    cfg = load_config("configs/qilin_full.yaml")
+    cfg["device"] = "cpu"
     cfg["data"]["processed_dir"] = str(processed)
     cfg["data"]["batch_size"] = 16
+    cfg["data"]["pin_memory"] = False
+    cfg["data"]["fast_loader"] = True
     cfg["train"]["output_dir"] = str(output)
     cfg["train"]["epochs"] = 1
+    cfg["train"]["amp"] = False
     cfg["model"]["embed_dim"] = 16
     cfg["model"]["hidden_dim"] = 32
     cfg["model"]["transformer_heads"] = 2
+    cfg["model"]["use_graph_embedding"] = False
+    cfg["loss"]["type_transition_weight"] = 0.03
+    cfg["loss"]["taxonomy_transition_weight"] = 0.03
     result = train(cfg)
     assert Path(result["output_dir"], "best.pt").exists()
     assert Path(result["output_dir"], "metrics.csv").exists()

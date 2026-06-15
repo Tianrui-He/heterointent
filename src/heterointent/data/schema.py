@@ -2,6 +2,16 @@ from __future__ import annotations
 
 TASKS = ("click", "collect", "share")
 
+INTENT_COLUMNS = [
+    "target_item_type",
+    "target_taxonomy_id",
+    "hist_dominant_item_type",
+    "hist_dominant_taxonomy_id",
+    "is_type_shift",
+    "is_taxonomy_shift",
+    "has_intent_target",
+]
+
 BASE_COLUMNS = [
     "request_id",
     "session_id",
@@ -15,6 +25,7 @@ BASE_COLUMNS = [
     "collect",
     "share",
     "next_item_type",
+    *INTENT_COLUMNS,
 ]
 
 FEATURE_PREFIXES = {
@@ -31,3 +42,11 @@ def prefixed_columns(columns: list[str], prefix: str) -> list[str]:
 
 def history_columns(max_history: int) -> list[str]:
     return [f"hist_item_{i}" for i in range(max_history)]
+
+
+def history_type_columns(max_history: int) -> list[str]:
+    return [f"hist_item_type_{i}" for i in range(max_history)]
+
+
+def history_taxonomy_columns(max_history: int) -> list[str]:
+    return [f"hist_taxonomy_id_{i}" for i in range(max_history)]

@@ -3,8 +3,8 @@ from __future__ import annotations
 import time
 from pathlib import Path
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
 from torch import nn
 from torch.optim import AdamW
@@ -21,6 +21,24 @@ from heterointent.utils import count_parameters, read_json, resolve_device, set_
 def _move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
     non_blocking = device.type == "cuda"
     return {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
+
+
+def _topk_hits(logits: torch.Tensor, target: torch.Tensor, k: int) -> torch.Tensor:
+    k = min(k, logits.size(-1))
+    top = torch.topk(logits, k=k, dim=-1).indices
+    return top.eq(target.clamp(min=0).unsqueeze(1)).any(dim=1) & target.gt(0)
+
+
+def _target_mrr(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    safe_target = target.clamp(min=0, max=logits.size(-1) - 1)
+    target_logits = logits.gather(1, safe_target.unsqueeze(1)).squeeze(1)
+    rank = logits.gt(target_logits.unsqueeze(1)).sum(dim=1).float() + 1.0
+    return torch.where(target.gt(0), rank.reciprocal(), torch.zeros_like(rank))
+
+
+def _attention_mass(attn: torch.Tensor, history_values: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    match = history_values.eq(target.unsqueeze(1)) & target.gt(0).unsqueeze(1)
+    return (attn.float() * match.float()).sum(dim=1)
 
 
 @torch.no_grad()
@@ -43,6 +61,49 @@ def predict_frame(model: nn.Module, loader, device: torch.device) -> pd.DataFram
         for task_idx, task in enumerate(TASKS):
             frame[task] = labels[:, task_idx].astype("int8", copy=False)
             frame[f"p_{task}"] = probs[:, task_idx]
+
+        dynamic_cols = [
+            "target_item_type",
+            "target_taxonomy_id",
+            "hist_dominant_item_type",
+            "hist_dominant_taxonomy_id",
+            "is_type_shift",
+            "is_taxonomy_shift",
+            "has_intent_target",
+        ]
+        for col in dynamic_cols:
+            if col in batch:
+                frame[col] = batch[col].detach().cpu().numpy().astype("int64", copy=False)
+
+        if "type_transition_logits" in outputs and "target_item_type" in batch:
+            type_logits = outputs["type_transition_logits"]
+            target_type = batch["target_item_type"]
+            frame["intent_type_hit@1"] = _topk_hits(type_logits, target_type, k=1).detach().cpu().numpy().astype("float32")
+            frame["intent_type_hit@2"] = _topk_hits(type_logits, target_type, k=2).detach().cpu().numpy().astype("float32")
+        if "taxonomy_transition_logits" in outputs and "target_taxonomy_id" in batch:
+            taxonomy_logits = outputs["taxonomy_transition_logits"]
+            target_taxonomy = batch["target_taxonomy_id"]
+            frame["intent_taxonomy_hit@1"] = (
+                _topk_hits(taxonomy_logits, target_taxonomy, k=1).detach().cpu().numpy().astype("float32")
+            )
+            frame["intent_taxonomy_hit@5"] = (
+                _topk_hits(taxonomy_logits, target_taxonomy, k=5).detach().cpu().numpy().astype("float32")
+            )
+            frame["intent_taxonomy_mrr"] = _target_mrr(taxonomy_logits, target_taxonomy).detach().cpu().numpy().astype("float32")
+        if "history_attention" in outputs:
+            attn = outputs["history_attention"]
+            if "history_item_types" in batch and "target_item_type" in batch:
+                frame["attention_type_target_mass"] = (
+                    _attention_mass(attn, batch["history_item_types"], batch["target_item_type"]).detach().cpu().numpy().astype("float32")
+                )
+            if "history_taxonomy_ids" in batch and "target_taxonomy_id" in batch:
+                frame["attention_taxonomy_target_mass"] = (
+                    _attention_mass(attn, batch["history_taxonomy_ids"], batch["target_taxonomy_id"])
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype("float32")
+                )
         frames.append(frame)
     if not frames:
         return pd.DataFrame(columns=["request_id", "item_id", "score", *TASKS, *[f"p_{t}" for t in TASKS]])

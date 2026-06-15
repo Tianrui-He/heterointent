@@ -21,7 +21,16 @@ def load_model(checkpoint_path: str | Path, device: str = "auto") -> tuple[Heter
     metadata = checkpoint["metadata"]
     config = checkpoint["config"]
     model = HeteroIntentPLE(metadata, config)
-    model.load_state_dict(checkpoint["model"])
+    try:
+        model.load_state_dict(checkpoint["model"])
+    except RuntimeError as exc:
+        if "transition_head" not in str(exc) and "type_transition_head" not in str(exc):
+            raise
+        incompatible = model.load_state_dict(checkpoint["model"], strict=False)
+        print(
+            "Loaded a legacy checkpoint with newly initialized dynamic-intent heads; "
+            f"missing={list(incompatible.missing_keys)}, unexpected={list(incompatible.unexpected_keys)}"
+        )
     model.to(resolved)
     model.eval()
     return model, metadata, config, resolved

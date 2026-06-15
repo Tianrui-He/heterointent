@@ -111,6 +111,7 @@ class UserInterestEncoder(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(embed_dim, 1),
         )
+        self.history_output = nn.Sequential(nn.LayerNorm(embed_dim), nn.Dropout(dropout))
         self.output = nn.Sequential(nn.Linear(embed_dim * 3, embed_dim), nn.LayerNorm(embed_dim), nn.ReLU())
 
     def forward(self, batch: dict[str, torch.Tensor], candidate_repr: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
@@ -125,6 +126,7 @@ class UserInterestEncoder(nn.Module):
         encoded = torch.nan_to_num(encoded)
         valid = (~mask).float().unsqueeze(-1)
         pooled = (encoded * valid).sum(dim=1) / valid.sum(dim=1).clamp_min(1.0)
+        history_intent = self.history_output(pooled)
 
         cand = candidate_repr.unsqueeze(1).expand_as(encoded)
         attn_input = torch.cat([encoded, cand, encoded * cand, torch.abs(encoded - cand)], dim=-1)
@@ -136,4 +138,4 @@ class UserInterestEncoder(nn.Module):
         din_interest = (encoded * attn.unsqueeze(-1)).sum(dim=1)
         user_base = self.user_embedding(batch["user_id"])
         user_repr = self.output(torch.cat([user_base, pooled, din_interest], dim=-1))
-        return user_repr, {"history_attention": attn}
+        return user_repr, {"history_attention": attn, "history_intent_repr": history_intent}

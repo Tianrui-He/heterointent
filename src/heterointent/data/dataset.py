@@ -9,7 +9,15 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 from heterointent.data.io import read_table
-from heterointent.data.schema import FEATURE_PREFIXES, TASKS, history_columns, prefixed_columns
+from heterointent.data.schema import (
+    FEATURE_PREFIXES,
+    INTENT_COLUMNS,
+    TASKS,
+    history_columns,
+    history_taxonomy_columns,
+    history_type_columns,
+    prefixed_columns,
+)
 
 
 class RankingDataset(Dataset):
@@ -41,11 +49,12 @@ class RankingDataset(Dataset):
             "click": 0,
             "collect": 0,
             "share": 0,
+            **{col: 0 for col in INTENT_COLUMNS},
         }
         for col, value in defaults.items():
             if col not in df.columns:
                 df[col] = value
-        for col in history_columns(self.max_history):
+        for col in [*history_columns(self.max_history), *history_type_columns(self.max_history), *history_taxonomy_columns(self.max_history)]:
             if col not in df.columns:
                 df[col] = 0
         for name, prefix in FEATURE_PREFIXES.items():
@@ -76,8 +85,17 @@ class RankingDataset(Dataset):
             "taxonomy_id": self._long_tensor(df, "taxonomy_id"),
             "position": self._long_tensor(df, "position"),
             "history_items": torch.from_numpy(df[history_columns(self.max_history)].to_numpy(dtype=np.int64, copy=True)),
+            "history_item_types": torch.from_numpy(df[history_type_columns(self.max_history)].to_numpy(dtype=np.int64, copy=True)),
+            "history_taxonomy_ids": torch.from_numpy(df[history_taxonomy_columns(self.max_history)].to_numpy(dtype=np.int64, copy=True)),
             "labels": torch.from_numpy(df[list(TASKS)].to_numpy(dtype=np.float32, copy=True)),
             "next_item_type": self._long_tensor(df, "next_item_type"),
+            "target_item_type": self._long_tensor(df, "target_item_type"),
+            "target_taxonomy_id": self._long_tensor(df, "target_taxonomy_id"),
+            "hist_dominant_item_type": self._long_tensor(df, "hist_dominant_item_type"),
+            "hist_dominant_taxonomy_id": self._long_tensor(df, "hist_dominant_taxonomy_id"),
+            "is_type_shift": self._long_tensor(df, "is_type_shift"),
+            "is_taxonomy_shift": self._long_tensor(df, "is_taxonomy_shift"),
+            "has_intent_target": self._long_tensor(df, "has_intent_target"),
         }
         for name, cols in self.feature_cols.items():
             tensors[f"{name}_feat"] = self._float_tensor(df, cols)

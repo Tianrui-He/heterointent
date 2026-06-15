@@ -40,6 +40,14 @@ def info_nce_loss(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.2) ->
     return (F.cross_entropy(logits, target) + F.cross_entropy(logits.T, target)) * 0.5
 
 
+def masked_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    mask = target.gt(0)
+    if not bool(mask.any()):
+        return logits.new_tensor(0.0)
+    target = target.clamp(min=0, max=logits.size(-1) - 1)
+    return F.cross_entropy(logits[mask], target[mask])
+
+
 def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], cfg: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     labels = batch["labels"]
     logits = outputs["logits"]
@@ -52,13 +60,20 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
     task_loss = (bce * task_weights).sum()
 
     bpr_weight = float(cfg.get("bpr_weight", 0.1))
-    transition_weight = float(cfg.get("transition_weight", 0.05))
+    legacy_transition_weight = float(cfg.get("transition_weight", 0.0))
+    type_transition_weight = float(cfg.get("type_transition_weight", legacy_transition_weight))
+    taxonomy_transition_weight = float(cfg.get("taxonomy_transition_weight", 0.0))
     contrastive_weight = float(cfg.get("contrastive_weight", 0.05))
 
     bpr = request_bpr_loss(outputs["final_score"], labels, batch["request_id"]) if bpr_weight > 0 else logits.new_tensor(0.0)
-    transition = (
-        F.cross_entropy(outputs["transition_logits"], batch["next_item_type"].clamp_min(0))
-        if transition_weight > 0
+    type_transition = (
+        masked_cross_entropy(outputs["type_transition_logits"], batch.get("target_item_type", batch["next_item_type"]))
+        if type_transition_weight > 0
+        else logits.new_tensor(0.0)
+    )
+    taxonomy_transition = (
+        masked_cross_entropy(outputs["taxonomy_transition_logits"], batch["target_taxonomy_id"])
+        if taxonomy_transition_weight > 0
         else logits.new_tensor(0.0)
     )
     contrastive = (
@@ -66,12 +81,20 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         if contrastive_weight > 0
         else logits.new_tensor(0.0)
     )
-    total = task_loss + bpr_weight * bpr + transition_weight * transition + contrastive_weight * contrastive
+    total = (
+        task_loss
+        + bpr_weight * bpr
+        + type_transition_weight * type_transition
+        + taxonomy_transition_weight * taxonomy_transition
+        + contrastive_weight * contrastive
+    )
     logs = {
         "loss": total.detach(),
         "task_loss": task_loss.detach(),
         "bpr_loss": bpr.detach(),
-        "transition_loss": transition.detach(),
+        "transition_loss": type_transition.detach(),
+        "type_transition_loss": type_transition.detach(),
+        "taxonomy_transition_loss": taxonomy_transition.detach(),
         "contrastive_loss": contrastive.detach(),
     }
     return total, logs
