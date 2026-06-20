@@ -7,10 +7,22 @@ from torch import nn
 
 
 class ItemEncoder(nn.Module):
-    def __init__(self, metadata: dict, embed_dim: int, max_position: int, dropout: float, use_graph_embedding: bool):
+    def __init__(
+        self,
+        metadata: dict,
+        embed_dim: int,
+        max_position: int,
+        dropout: float,
+        use_graph_embedding: bool,
+        disabled_modalities: list[str] | None = None,
+    ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_graph_embedding = use_graph_embedding
+        self.disabled_modalities = set(disabled_modalities or [])
+        unsupported = self.disabled_modalities - {"text", "image", "video", "dense"}
+        if unsupported:
+            raise ValueError(f"Unsupported disabled modalities: {sorted(unsupported)}")
         self.item_embedding = nn.Embedding(int(metadata["num_items"]), embed_dim, padding_idx=0)
         self.type_embedding = nn.Embedding(int(metadata["num_item_types"]), embed_dim, padding_idx=0)
         self.taxonomy_embedding = nn.Embedding(int(metadata["num_taxonomies"]), embed_dim, padding_idx=0)
@@ -26,7 +38,7 @@ class ItemEncoder(nn.Module):
         }
         self.projections = nn.ModuleDict()
         for name, dim in dims.items():
-            if dim > 0:
+            if dim > 0 and name not in self.disabled_modalities:
                 self.projections[name] = nn.Sequential(nn.Linear(dim, embed_dim), nn.LayerNorm(embed_dim), nn.ReLU())
         gate_inputs = embed_dim * (4 + len(self.projections) + int(use_graph_embedding))
         self.gate = nn.Linear(gate_inputs, 4 + len(self.projections) + int(use_graph_embedding))

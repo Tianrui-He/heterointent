@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
+from sklearn.metrics import average_precision_score, roc_auc_score
 
 TASKS = ("click", "collect", "share")
 TASK_WEIGHTS = {"click": 0.3, "collect": 0.4, "share": 0.3}
@@ -16,6 +16,31 @@ def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     return float(roc_auc_score(y_true, y_score))
 
 
+def _safe_ap(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    if len(np.unique(y_true)) < 2:
+        return float("nan")
+    return float(average_precision_score(y_true, y_score))
+
+
+def _binary_pair_auc(scores: np.ndarray, labels: np.ndarray) -> float:
+    labels = labels.astype(bool, copy=False)
+    pos = scores[labels]
+    neg = scores[~labels]
+    if len(pos) == 0 or len(neg) == 0:
+        return float("nan")
+    comparisons = pos[:, None] - neg[None, :]
+    return float((comparisons > 0).mean() + 0.5 * (comparisons == 0).mean())
+
+
+def _graded_pair_auc(scores: np.ndarray, relevance: np.ndarray) -> float:
+    rel_diff = relevance[:, None] - relevance[None, :]
+    score_diff = scores[:, None] - scores[None, :]
+    mask = rel_diff > 0
+    if not bool(mask.any()):
+        return float("nan")
+    return float((score_diff[mask] > 0).mean() + 0.5 * (score_diff[mask] == 0).mean())
+
+
 def _dcg(relevances: list[float]) -> float:
     return sum(rel / math.log2(idx + 2) for idx, rel in enumerate(relevances))
 
@@ -24,6 +49,18 @@ def _safe_mean(values: pd.Series) -> float:
     if values.empty:
         return float("nan")
     return float(values.mean())
+
+
+def _weighted_available(metrics: dict[str, float], prefix: str) -> float:
+    total = 0.0
+    weight_sum = 0.0
+    for task, weight in TASK_WEIGHTS.items():
+        value = metrics.get(f"{prefix}_{task}")
+        if value is None or not np.isfinite(value):
+            continue
+        total += weight * value
+        weight_sum += weight
+    return float(total / weight_sum) if weight_sum > 0 else float("nan")
 
 
 def deduplicate_request_items(df: pd.DataFrame) -> pd.DataFrame:
@@ -68,6 +105,9 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
         ranked = group.sort_values("score", ascending=False).head(topk)
         first = group.iloc[0]
         row: dict[str, float] = {}
+        row["candidate_count"] = float(len(group))
+        row["is_trivial_topk_request"] = float(len(group) <= topk)
+        row["is_hard_topk_request"] = float(len(group) > topk)
         weighted_rel_all = (
             TASK_WEIGHTS["click"] * group["click"].to_numpy()
             + TASK_WEIGHTS["collect"] * group["collect"].to_numpy()
@@ -80,6 +120,7 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
         )
         ideal = sorted(weighted_rel_all.tolist(), reverse=True)[:topk]
         row["ndcg@20"] = _dcg(weighted_rel_top.tolist()) / max(_dcg(ideal), 1e-12)
+        row["request_pair_auc_weighted"] = _graded_pair_auc(group["score"].to_numpy(), weighted_rel_all)
         for task in TASKS:
             positives = int(group[task].sum())
             top_positives = int(ranked[task].sum())
@@ -91,6 +132,19 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
             row[f"recall_{task}@20"] = recall
             row[f"recall_{task}_overall@20"] = recall if has_positive else 0.0
             row[f"has_{task}_positive"] = float(has_positive)
+            score_col = f"p_{task}"
+            if score_col in group.columns:
+                task_scores = group[score_col].to_numpy()
+                task_labels = group[task].to_numpy()
+                row[f"request_auc_{task}"] = _binary_pair_auc(task_scores, task_labels)
+                row[f"request_ap_{task}"] = (
+                    _safe_ap(task_labels, task_scores)
+                    if len(np.unique(task_labels)) >= 2
+                    else float("nan")
+                )
+            else:
+                row[f"request_auc_{task}"] = np.nan
+                row[f"request_ap_{task}"] = np.nan
         row["weighted_hit@20"] = sum(TASK_WEIGHTS[t] * row[f"hit_{t}@20"] for t in TASKS)
         for col in gate_cols:
             row[f"top20_mean_{col}"] = float(ranked[col].mean())
@@ -133,14 +187,46 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
 
     per_request_df = pd.DataFrame(per_request)
     metrics = per_request_df.mean(numeric_only=True).to_dict()
+    metrics["topk"] = float(topk)
+    metrics["candidate_count_le_topk_rate"] = float(per_request_df["candidate_count"].le(topk).mean())
+    metrics["candidate_count_gt_topk_rate"] = float(per_request_df["candidate_count"].gt(topk).mean())
+    metrics["candidate_count_le20_rate"] = metrics["candidate_count_le_topk_rate"]
+    metrics["candidate_count_gt20_rate"] = metrics["candidate_count_gt_topk_rate"]
+    hard_requests = per_request_df[per_request_df["is_hard_topk_request"].gt(0)]
+    metrics["hard_topk_requests"] = float(len(hard_requests))
+    metrics["hard_topk_request_rate"] = float(len(hard_requests) / max(len(per_request_df), 1))
+    hard_metric_cols = [
+        "weighted_hit@20",
+        "ndcg@20",
+        "request_pair_auc_weighted",
+        *[f"hit_{task}@20" for task in TASKS],
+        *[f"hit_{task}_positive@20" for task in TASKS],
+        *[f"recall_{task}@20" for task in TASKS],
+        *[f"request_auc_{task}" for task in TASKS],
+        *[f"request_ap_{task}" for task in TASKS],
+    ]
+    for col in hard_metric_cols:
+        if col in hard_requests:
+            metrics[f"hard_{col}"] = _safe_mean(hard_requests[col])
     for task in TASKS:
         score_col = f"p_{task}"
         if score_col in df.columns:
             metrics[f"auc_{task}"] = _safe_auc(df[task].to_numpy(), df[score_col].to_numpy())
+            metrics[f"ap_{task}"] = _safe_ap(df[task].to_numpy(), df[score_col].to_numpy())
         metrics[f"positive_requests_{task}"] = float(df.groupby("request_id")[task].sum().gt(0).sum())
         metrics[f"positive_request_rate_{task}"] = float(metrics[f"has_{task}_positive"])
+        request_auc_col = f"request_auc_{task}"
+        request_ap_col = f"request_ap_{task}"
+        metrics[f"request_auc_requests_{task}"] = float(per_request_df[request_auc_col].notna().sum())
+        metrics[f"request_auc_request_rate_{task}"] = float(per_request_df[request_auc_col].notna().mean())
+        metrics[f"request_ap_requests_{task}"] = float(per_request_df[request_ap_col].notna().sum())
+        metrics[f"request_ap_request_rate_{task}"] = float(per_request_df[request_ap_col].notna().mean())
     for col in gate_cols:
         metrics[f"mean_{col}"] = float(df[col].mean())
+    metrics["request_auc_weighted"] = _weighted_available(metrics, "request_auc")
+    metrics["request_ap_weighted"] = _weighted_available(metrics, "request_ap")
+    metrics["hard_request_auc_weighted"] = _weighted_available(metrics, "hard_request_auc")
+    metrics["hard_request_ap_weighted"] = _weighted_available(metrics, "hard_request_ap")
 
     if has_dynamic:
         target_requests = per_request_df[per_request_df["has_intent_target"].gt(0)]

@@ -198,13 +198,12 @@ D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\prepare_qilin.py --qilin-dir
 ### 2. 生成文本 embedding
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --model-name D:\models\Qwen2-0.5B --batch-size 64 --max-length 256 --device cuda
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --model-name D:\models\bge-small-zh-v1.5 --batch-size 256 --max-length 256 --pooling cls --device cuda
 ```
-
-这一阶段需要为约 94.6 万个 item 生成文本向量，耗时明显长于单轮训练是正常现象。后续可替换为更适合 embedding 的中文模型，例如：
+这一阶段需要为约 94.6 万个 item 生成文本向量，耗时明显长于单轮训练是正常现象。BGE 系列建议使用 `--pooling cls`；如果换回 Qwen 等通用 Transformer，可以使用默认的 `--pooling mean`。
 
 ```powershell
---model-name D:\models\bge-small-zh-v1.5
+--pooling cls
 ```
 
 ### 3. 合并文本 embedding

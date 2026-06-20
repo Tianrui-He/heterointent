@@ -27,6 +27,7 @@ model:
   ple_layers: 3
   use_graph_embedding: true
   graph_embedding_trainable: false
+  disabled_modalities: []
 
 loss:
   task_weights:

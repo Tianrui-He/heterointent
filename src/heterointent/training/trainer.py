@@ -152,6 +152,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
         num_workers=int(data_cfg.get("num_workers", 0)),
         pin_memory=bool(data_cfg.get("pin_memory", device.type == "cuda")),
         fast_loader=bool(data_cfg.get("fast_loader", False)),
+        request_preserving=bool(data_cfg.get("request_preserving_train", data_cfg.get("request_preserving", False))),
     )
     valid_loader = build_dataloader(
         processed_dir / data_cfg.get("valid_file", "valid.parquet"),

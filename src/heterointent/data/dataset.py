@@ -138,6 +138,69 @@ class FastTensorBatchLoader:
                 yield self._maybe_pin({key: value[start:end] for key, value in self.tensors.items()})
 
 
+class RequestPreservingBatchLoader:
+    """Batch complete request groups so ranking losses see within-request candidates."""
+
+    def __init__(self, dataset: RankingDataset, batch_size: int, shuffle: bool, pin_memory: bool = False):
+        self.tensors = dataset.tensors
+        self.batch_size = int(batch_size)
+        self.shuffle = bool(shuffle)
+        self.pin_memory = bool(pin_memory and torch.cuda.is_available())
+        self.num_samples = len(dataset)
+        self.groups = self._build_groups(dataset.tensors["request_id"])
+        self.group_sizes = [int(group.numel()) for group in self.groups]
+
+    @staticmethod
+    def _build_groups(request_ids: torch.Tensor) -> list[torch.Tensor]:
+        ids = request_ids.detach().cpu().numpy()
+        if ids.size == 0:
+            return []
+        order = np.argsort(ids, kind="mergesort")
+        sorted_ids = ids[order]
+        starts = np.flatnonzero(np.r_[True, sorted_ids[1:] != sorted_ids[:-1]])
+        ends = np.r_[starts[1:], len(order)]
+        return [torch.from_numpy(order[start:end].astype(np.int64, copy=True)) for start, end in zip(starts, ends)]
+
+    def __len__(self) -> int:
+        if not self.group_sizes:
+            return 0
+        batches = 0
+        current = 0
+        for size in self.group_sizes:
+            if current > 0 and current + size > self.batch_size:
+                batches += 1
+                current = 0
+            current += size
+        return batches + int(current > 0)
+
+    def _maybe_pin(self, batch: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        if not self.pin_memory:
+            return batch
+        return {key: value.pin_memory() for key, value in batch.items()}
+
+    def _batch_from_groups(self, groups: list[torch.Tensor]) -> dict[str, torch.Tensor]:
+        idx = groups[0] if len(groups) == 1 else torch.cat(groups)
+        return self._maybe_pin({key: value.index_select(0, idx) for key, value in self.tensors.items()})
+
+    def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        if not self.groups:
+            return
+        group_order = torch.randperm(len(self.groups)).tolist() if self.shuffle else list(range(len(self.groups)))
+        pending: list[torch.Tensor] = []
+        pending_size = 0
+        for group_idx in group_order:
+            group = self.groups[group_idx]
+            group_size = int(group.numel())
+            if pending and pending_size + group_size > self.batch_size:
+                yield self._batch_from_groups(pending)
+                pending = []
+                pending_size = 0
+            pending.append(group)
+            pending_size += group_size
+        if pending:
+            yield self._batch_from_groups(pending)
+
+
 def build_dataloader(
     table_path: str | Path,
     metadata: dict[str, Any],
@@ -146,8 +209,11 @@ def build_dataloader(
     num_workers: int = 0,
     pin_memory: bool = False,
     fast_loader: bool = False,
+    request_preserving: bool = False,
 ):
     dataset = RankingDataset(table_path, metadata)
+    if request_preserving:
+        return RequestPreservingBatchLoader(dataset, batch_size=batch_size, shuffle=shuffle, pin_memory=pin_memory)
     if fast_loader:
         return FastTensorBatchLoader(dataset, batch_size=batch_size, shuffle=shuffle, pin_memory=pin_memory)
     kwargs: dict[str, Any] = {

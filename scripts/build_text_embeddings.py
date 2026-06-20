@@ -1,6 +1,7 @@
 ﻿from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
@@ -18,6 +19,14 @@ def mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> 
     summed = (last_hidden_state * mask).sum(dim=1)
     denom = mask.sum(dim=1).clamp_min(1e-6)
     return summed / denom
+
+
+def pool_hidden_state(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor, pooling: str) -> torch.Tensor:
+    if pooling == "cls":
+        return last_hidden_state[:, 0]
+    if pooling == "mean":
+        return mean_pool(last_hidden_state, attention_mask)
+    raise ValueError(f"Unsupported pooling: {pooling}")
 
 
 def load_notes(qilin_dir: Path, item_map_path: Path) -> pd.DataFrame:
@@ -42,6 +51,7 @@ def main() -> None:
     parser.add_argument("--model-name", default="BAAI/bge-small-zh-v1.5")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=256)
+    parser.add_argument("--pooling", choices=["mean", "cls"], default="mean", help="Use cls for BGE-style encoders; mean preserves the previous behavior.")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
 
@@ -63,14 +73,28 @@ def main() -> None:
             texts = notes["text"].iloc[start:start + args.batch_size].tolist()
             batch = tokenizer(texts, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt").to(device)
             out = model(**batch)
-            emb = mean_pool(out.last_hidden_state, batch["attention_mask"])
+            emb = pool_hidden_state(out.last_hidden_state, batch["attention_mask"], args.pooling)
             emb = torch.nn.functional.normalize(emb, dim=-1)
             all_embs.append(emb.float().cpu().numpy().astype("float32"))
     values = np.concatenate(all_embs, axis=0) if all_embs else np.zeros((0, 0), dtype="float32")
     np.save(processed / "text_embeddings.npy", values)
     np.save(processed / "text_embedding_item_ids.npy", notes["item_id"].to_numpy(dtype="int64"))
     notes[["item_id", "raw_item_id"]].to_parquet(processed / "text_embedding_items.parquet", index=False)
-    print(f"wrote text embeddings {values.shape} to {processed}")
+    (processed / "text_embedding_config.json").write_text(
+        json.dumps(
+            {
+                "model_name": args.model_name,
+                "pooling": args.pooling,
+                "max_length": args.max_length,
+                "num_items": int(len(notes)),
+                "embedding_shape": list(values.shape),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"wrote text embeddings {values.shape} to {processed} with pooling={args.pooling}")
 
 
 if __name__ == "__main__":
