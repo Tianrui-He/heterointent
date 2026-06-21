@@ -99,7 +99,7 @@ def test_dynamic_intent_metrics_exclude_no_target_requests() -> None:
             },
         ]
     )
-    metrics = compute_ranking_metrics(df, topk=1)
+    metrics = compute_ranking_metrics(df, topk=1, include_diagnostics=True)
     assert metrics["intent_target_requests"] == 1.0
     assert metrics["intent_type_acc@1"] == 1.0
     assert metrics["intent_taxonomy_acc@5"] == 1.0

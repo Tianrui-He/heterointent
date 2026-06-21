@@ -34,6 +34,9 @@ class HeteroIntentPLE(nn.Module):
         dropout = float(model_cfg.get("dropout", 0.1))
         use_graph = bool(model_cfg.get("use_graph_embedding", False))
         self.enable_intent_heads = bool(model_cfg.get("enable_intent_heads", True))
+        self.use_rank_head = bool(model_cfg.get("use_rank_head", False))
+        default_rank_blend = 0.5 if self.use_rank_head else 0.0
+        self.rank_score_blend = min(max(float(model_cfg.get("rank_score_blend", default_rank_blend)), 0.0), 1.0)
 
         self.item_encoder = ItemEncoder(
             metadata=metadata,
@@ -78,6 +81,8 @@ class HeteroIntentPLE(nn.Module):
         else:
             raise ValueError(f"Unknown ranker: {ranker}")
 
+        if self.use_rank_head:
+            self.rank_score_head = nn.Linear(hidden_dim, 1)
         if self.enable_intent_heads:
             self.type_transition_head = mlp(embed_dim, [hidden_dim], int(metadata["num_item_types"]), dropout=dropout)
             self.taxonomy_transition_head = mlp(embed_dim, [hidden_dim], int(metadata["num_taxonomies"]), dropout=dropout)
@@ -101,15 +106,28 @@ class HeteroIntentPLE(nn.Module):
         logits, ranker_extra = self.ranker(h)
         probs = torch.sigmoid(logits)
         score_weights = self.score_weights.to(probs.device)
-        final_score = (probs * score_weights).sum(dim=-1)
+        weighted_prob_score = (probs * score_weights).sum(dim=-1)
+        final_score = weighted_prob_score
         result = {
             "logits": logits,
             "probs": probs,
+            "weighted_prob_score": weighted_prob_score,
             "final_score": final_score,
             **item_extra,
             **user_extra,
             **ranker_extra,
         }
+        if self.use_rank_head:
+            rank_logit = self.rank_score_head(h).squeeze(-1)
+            rank_score = torch.sigmoid(rank_logit)
+            final_score = (1.0 - self.rank_score_blend) * weighted_prob_score + self.rank_score_blend * rank_score
+            result.update(
+                {
+                    "rank_logit": rank_logit,
+                    "rank_score": rank_score,
+                    "final_score": final_score,
+                }
+            )
         if self.enable_intent_heads:
             history_intent = user_extra["history_intent_repr"]
             type_transition_logits = self.type_transition_head(history_intent)

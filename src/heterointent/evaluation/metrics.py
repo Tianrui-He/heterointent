@@ -8,6 +8,28 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 TASKS = ("click", "collect", "share")
 TASK_WEIGHTS = {"click": 0.3, "collect": 0.4, "share": 0.3}
+CORE_METRIC_KEYS = [
+    "topk",
+    "num_requests",
+    "num_rows",
+    "candidate_count",
+    "candidate_count_gt_topk_rate",
+    "weighted_hit@20",
+    "ndcg@20",
+    "preference_auc",
+    "hard_topk_request_rate",
+    "hard_weighted_hit@20",
+    "hard_ndcg@20",
+    "hard_preference_auc",
+    "request_auc_click",
+    "request_auc_collect",
+    "request_auc_share",
+    "request_ap_collect",
+    "request_ap_share",
+    "request_auc_request_rate_click",
+    "request_auc_request_rate_collect",
+    "request_auc_request_rate_share",
+]
 
 
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
@@ -63,6 +85,10 @@ def _weighted_available(metrics: dict[str, float], prefix: str) -> float:
     return float(total / weight_sum) if weight_sum > 0 else float("nan")
 
 
+def _filter_core_metrics(metrics: dict[str, float]) -> dict[str, float]:
+    return {key: metrics[key] for key in CORE_METRIC_KEYS if key in metrics}
+
+
 def deduplicate_request_items(df: pd.DataFrame) -> pd.DataFrame:
     """Keep one scored row per request-item pair."""
 
@@ -84,8 +110,8 @@ def deduplicate_request_items(df: pd.DataFrame) -> pd.DataFrame:
     return first.merge(labels, on=keys, how="left").reset_index(drop=True)
 
 
-def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float]:
-    """Compute request-level Top-K metrics for ranking and dynamic intent."""
+def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20, include_diagnostics: bool = False) -> dict[str, float]:
+    """Compute representative request-level metrics for ranking quality."""
 
     if df.empty:
         return {}
@@ -227,6 +253,8 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
     metrics["request_ap_weighted"] = _weighted_available(metrics, "request_ap")
     metrics["hard_request_auc_weighted"] = _weighted_available(metrics, "hard_request_auc")
     metrics["hard_request_ap_weighted"] = _weighted_available(metrics, "hard_request_ap")
+    metrics["preference_auc"] = metrics.get("request_pair_auc_weighted", float("nan"))
+    metrics["hard_preference_auc"] = metrics.get("hard_request_pair_auc_weighted", float("nan"))
 
     if has_dynamic:
         target_requests = per_request_df[per_request_df["has_intent_target"].gt(0)]
@@ -257,4 +285,7 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20) -> dict[str, float
     metrics["num_rows"] = float(len(df))
     metrics["num_raw_rows"] = float(raw_rows)
     metrics["num_duplicate_rows_removed"] = float(duplicate_rows_removed)
-    return {k: float(v) for k, v in metrics.items()}
+    metrics = {k: float(v) for k, v in metrics.items()}
+    if include_diagnostics:
+        return metrics
+    return _filter_core_metrics(metrics)
