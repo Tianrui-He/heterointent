@@ -273,6 +273,22 @@ request_id, rank, item_id, score, p_click, p_collect, p_share
 - `mean_gate_*`：所有候选样本上的平均模态 gate 权重。
 - `top20_mean_gate_*`：Top-20 候选上的平均模态 gate 权重。
 
+## Visual Thumbnail Pipeline
+
+The visual version keeps CLIP/SigLIP outside the deployed recommender. Image/video thumbnail embeddings are generated offline, compressed to 128 dimensions, then appended after the existing image/video metadata features.
+
+```powershell
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_visual_embeddings.py --modality both --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --image-root data\raw\Qilin\images --video-root data\raw\Qilin\video_thumbnails --model-name openai/clip-vit-base-patch32 --output-dim 128 --compression auto --batch-size 64 --device cuda
+
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\merge_embeddings.py --processed-dir data\processed\qilin_full_multimodal_meta --output-dir data\processed\qilin_full_multimodal_visual --image --video --merge-mode auto
+
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\check_parameter_budget.py --config configs\qilin_score_opt_mild_visual.yaml --budget-mb 800 --fail-over-budget
+
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_score_opt_mild_visual.yaml
+```
+
+For a fast no-download smoke test, add `--mock-encoder --max-items 1000` to `build_visual_embeddings.py`. The mock vectors are deterministic and only validate the data path; they are not meant for final metrics.
+
 ## 后续优化方向
 
 1. 接入真实图片文件后，用 `scripts/build_visual_embeddings.py` 生成 CLIP/SigLIP 图像 embedding，再与当前 image metadata 拼接或替换。
