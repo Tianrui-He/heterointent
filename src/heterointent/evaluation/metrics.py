@@ -8,37 +8,63 @@ from sklearn.metrics import average_precision_score, roc_auc_score
 
 TASKS = ("click", "collect", "share")
 TASK_WEIGHTS = {"click": 0.3, "collect": 0.4, "share": 0.3}
+RANKING_QUALITY_WEIGHTS = {
+    "hard_ndcg@20": 0.35,
+    "hard_preference_auc": 0.30,
+    "ndcg@20": 0.20,
+    "preference_auc": 0.15,
+}
+RECOMMENDATION_QUALITY_WEIGHTS = {
+    "request_ap_collect": 0.30,
+    "request_ap_share": 0.30,
+    "request_auc_collect": 0.20,
+    "request_auc_share": 0.15,
+    "request_auc_click": 0.05,
+}
 CORE_METRIC_KEYS = [
     "topk",
     "num_requests",
     "num_rows",
     "candidate_count",
     "candidate_count_gt_topk_rate",
+    "quality_score",
+    "ranking_quality_score",
+    "recommendation_quality_score",
     "weighted_hit@20",
-    "ndcg@20",
-    "preference_auc",
-    "hard_topk_request_rate",
     "hard_weighted_hit@20",
+    "ndcg@20",
     "hard_ndcg@20",
+    "preference_auc",
     "hard_preference_auc",
     "request_auc_click",
     "request_auc_collect",
     "request_auc_share",
     "request_ap_collect",
     "request_ap_share",
-    "request_auc_request_rate_click",
-    "request_auc_request_rate_collect",
-    "request_auc_request_rate_share",
 ]
 
 
+def _finite_mask(y_true: np.ndarray, y_score: np.ndarray) -> np.ndarray:
+    return np.isfinite(y_score) & np.isfinite(y_true)
+
+
 def _safe_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    mask = _finite_mask(y_true, y_score)
+    if not bool(mask.any()):
+        return float("nan")
+    y_true = y_true[mask]
+    y_score = y_score[mask]
     if len(np.unique(y_true)) < 2:
         return float("nan")
     return float(roc_auc_score(y_true, y_score))
 
 
 def _safe_ap(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    mask = _finite_mask(y_true, y_score)
+    if not bool(mask.any()):
+        return float("nan")
+    y_true = y_true[mask]
+    y_score = y_score[mask]
     if len(np.unique(y_true)) < 2:
         return float("nan")
     return float(average_precision_score(y_true, y_score))
@@ -78,6 +104,18 @@ def _weighted_available(metrics: dict[str, float], prefix: str) -> float:
     weight_sum = 0.0
     for task, weight in TASK_WEIGHTS.items():
         value = metrics.get(f"{prefix}_{task}")
+        if value is None or not np.isfinite(value):
+            continue
+        total += weight * value
+        weight_sum += weight
+    return float(total / weight_sum) if weight_sum > 0 else float("nan")
+
+
+def _weighted_metric_score(metrics: dict[str, float], weights: dict[str, float]) -> float:
+    total = 0.0
+    weight_sum = 0.0
+    for key, weight in weights.items():
+        value = metrics.get(key)
         if value is None or not np.isfinite(value):
             continue
         total += weight * value
@@ -255,6 +293,15 @@ def compute_ranking_metrics(df: pd.DataFrame, topk: int = 20, include_diagnostic
     metrics["hard_request_ap_weighted"] = _weighted_available(metrics, "hard_request_ap")
     metrics["preference_auc"] = metrics.get("request_pair_auc_weighted", float("nan"))
     metrics["hard_preference_auc"] = metrics.get("hard_request_pair_auc_weighted", float("nan"))
+    metrics["ranking_quality_score"] = _weighted_metric_score(metrics, RANKING_QUALITY_WEIGHTS)
+    metrics["recommendation_quality_score"] = _weighted_metric_score(metrics, RECOMMENDATION_QUALITY_WEIGHTS)
+    metrics["quality_score"] = _weighted_metric_score(
+        metrics,
+        {
+            "ranking_quality_score": 0.60,
+            "recommendation_quality_score": 0.40,
+        },
+    )
 
     if has_dynamic:
         target_requests = per_request_df[per_request_df["has_intent_target"].gt(0)]

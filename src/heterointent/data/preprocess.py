@@ -15,7 +15,13 @@ def infer_metadata(df: pd.DataFrame, max_history: int = 20) -> dict:
         "num_users": int(df["user_id"].max()) + 1 if "user_id" in df else 1,
         "num_items": int(df["item_id"].max()) + 1 if "item_id" in df else 1,
         "num_item_types": int(df["item_type"].max()) + 1 if "item_type" in df else 1,
+        "num_taxonomy1": int(df["taxonomy1_id"].max()) + 1 if "taxonomy1_id" in df else 1,
+        "num_taxonomy2": int(df["taxonomy2_id"].max()) + 1 if "taxonomy2_id" in df else 1,
         "num_taxonomies": int(df["taxonomy_id"].max()) + 1 if "taxonomy_id" in df else 1,
+        "num_genders": int(df["gender_id"].max()) + 1 if "gender_id" in df else 1,
+        "num_platforms": int(df["platform_id"].max()) + 1 if "platform_id" in df else 1,
+        "num_ages": int(df["age_id"].max()) + 1 if "age_id" in df else 1,
+        "num_locations": int(df["location_id"].max()) + 1 if "location_id" in df else 1,
         "max_history": max_history,
     }
     for name, prefix in FEATURE_PREFIXES.items():

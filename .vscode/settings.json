@@ -1,0 +1,7 @@
+{
+  "git.enabled": true,
+  "git.autoRepositoryDetection": true,
+  "git.openRepositoryInParentFolders": "always",
+  "git.path": "D:\\Git\\cmd\\git.exe",
+  "git.untrackedChanges": "mixed"
+}

@@ -18,12 +18,20 @@ def main() -> None:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--samples", required=True)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--fast-loader", action="store_true", help="Use tensor batch loader for faster GPU inference")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--topk", type=int, default=20)
     args = parser.parse_args()
 
     model, metadata, _, device = load_model(args.checkpoint, device=args.device)
-    loader = build_dataloader(args.samples, metadata, batch_size=args.batch_size, shuffle=False)
+    loader = build_dataloader(
+        args.samples,
+        metadata,
+        batch_size=args.batch_size,
+        shuffle=False,
+        fast_loader=bool(args.fast_loader),
+        pin_memory=device.type == "cuda",
+    )
     pred = predict_frame(model, loader, device)
     metrics = compute_ranking_metrics(pred, topk=args.topk)
     print(metrics)

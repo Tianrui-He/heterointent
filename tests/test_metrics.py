@@ -18,6 +18,8 @@ def test_weighted_hit_at_20() -> None:
     metrics = compute_ranking_metrics(df, topk=1)
     assert metrics["weighted_hit@20"] == 0.3
     assert abs(metrics["ndcg@20"] - 0.875) < 1e-6
+    assert 0.0 <= metrics["ranking_quality_score"] <= 1.0
+    assert 0.0 <= metrics["quality_score"] <= 1.0
 
     diagnostics = compute_ranking_metrics(df, topk=1, include_diagnostics=True)
     assert diagnostics["hit_click@20"] == 0.5
@@ -38,11 +40,12 @@ def test_request_auc_skips_requests_without_task_positives() -> None:
     )
 
     metrics = compute_ranking_metrics(df, topk=1)
+    diagnostics = compute_ranking_metrics(df, topk=1, include_diagnostics=True)
 
     assert metrics["request_auc_collect"] == 1.0
-    assert metrics["request_auc_request_rate_collect"] == 0.5
+    assert diagnostics["request_auc_request_rate_collect"] == 0.5
     assert pd.isna(metrics["request_auc_share"])
-    assert metrics["request_auc_request_rate_share"] == 0.0
+    assert diagnostics["request_auc_request_rate_share"] == 0.0
 
 
 def test_hard_topk_metrics_only_use_candidate_count_above_topk() -> None:
@@ -57,9 +60,10 @@ def test_hard_topk_metrics_only_use_candidate_count_above_topk() -> None:
     )
 
     metrics = compute_ranking_metrics(df, topk=2)
+    diagnostics = compute_ranking_metrics(df, topk=2, include_diagnostics=True)
 
     assert metrics["candidate_count_gt_topk_rate"] == 0.5
-    assert metrics["hard_topk_request_rate"] == 0.5
+    assert diagnostics["hard_topk_request_rate"] == 0.5
     assert metrics["hard_weighted_hit@20"] == 0.0
     assert metrics["hard_ndcg@20"] == 0.0
     assert metrics["hard_preference_auc"] == 0.0

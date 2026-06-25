@@ -24,11 +24,13 @@ def load_model(checkpoint_path: str | Path, device: str = "auto") -> tuple[Heter
     try:
         model.load_state_dict(checkpoint["model"])
     except RuntimeError as exc:
-        if "transition_head" not in str(exc) and "type_transition_head" not in str(exc):
+        message = str(exc)
+        legacy_missing_only = "Missing key(s)" in message and "size mismatch" not in message and "Unexpected key(s)" not in message
+        if "transition_head" not in message and "type_transition_head" not in message and not legacy_missing_only:
             raise
         incompatible = model.load_state_dict(checkpoint["model"], strict=False)
         print(
-            "Loaded a legacy checkpoint with newly initialized dynamic-intent heads; "
+            "Loaded a legacy checkpoint with newly initialized compatible heads/aliases; "
             f"missing={list(incompatible.missing_keys)}, unexpected={list(incompatible.unexpected_keys)}"
         )
     model.to(resolved)

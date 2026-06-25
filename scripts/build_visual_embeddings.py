@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Iterable
 
@@ -15,11 +16,15 @@ import numpy as np
 import pandas as pd
 import pyarrow.parquet as pq
 import torch
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
 PATH_PREFIXES = {"image", "images", "video", "videos", "thumbnail", "thumbnails"}
+CACHE_INDEX_NAME = "path_embedding_index.parquet"
+CACHE_VALUES_NAME = "path_embeddings.npy"
+CACHE_META_NAME = "path_embedding_cache.json"
 
 
 def _as_list(value: object) -> list[str]:
@@ -69,30 +74,65 @@ def _read_notes(qilin_dir: Path | None) -> pd.DataFrame:
     return notes[wanted]
 
 
-def _candidate_paths(root: Path | None, raw_item_id: int, image_paths: object) -> Iterable[Path]:
+def _available_child_dirs(root: Path | None) -> set[str]:
+    if root is None or not root.exists():
+        return set()
+    return {path.name.lower() for path in root.iterdir() if path.is_dir()}
+
+
+def _candidate_paths(
+    root: Path | None,
+    raw_item_id: int,
+    image_paths: object,
+    available_dirs: set[str] | None = None,
+    fallback_raw_id_paths: bool = True,
+) -> Iterable[tuple[Path, bool]]:
     if root is None:
         return []
-    candidates: list[Path] = []
+    available = available_dirs or set()
+    candidates: list[tuple[Path, bool]] = []
     for raw in _as_list(image_paths):
         rel = Path(str(raw).replace("\\", "/"))
-        candidates.extend([root / rel, root / rel.name])
+        if rel.is_absolute():
+            candidates.append((rel, False))
+            continue
         parts = rel.parts
         if parts and parts[0].lower() in PATH_PREFIXES and len(parts) > 1:
-            candidates.append(root.joinpath(*parts[1:]))
-    for suffix in IMAGE_SUFFIXES:
-        candidates.append(root / f"{raw_item_id}{suffix}")
+            if parts[1].lower() in available:
+                candidates.append((root.joinpath(*parts[1:]), True))
+        else:
+            if parts and parts[0].lower() in available:
+                candidates.append((root / rel, True))
+            if len(parts) <= 1:
+                candidates.append((root / rel.name, False))
+    if fallback_raw_id_paths:
+        for suffix in IMAGE_SUFFIXES:
+            candidates.append((root / f"{raw_item_id}{suffix}", False))
     return candidates
 
 
-def _resolve_existing_paths(root: Path | None, raw_item_id: int, image_paths: object, max_paths: int) -> list[Path]:
+def _resolve_existing_paths(
+    root: Path | None,
+    raw_item_id: int,
+    image_paths: object,
+    max_paths: int,
+    available_dirs: set[str] | None = None,
+    fallback_raw_id_paths: bool = True,
+) -> list[Path]:
     seen: set[str] = set()
     found: list[Path] = []
-    for candidate in _candidate_paths(root, raw_item_id, image_paths):
+    for candidate, trusted_parent in _candidate_paths(
+        root,
+        raw_item_id,
+        image_paths,
+        available_dirs=available_dirs,
+        fallback_raw_id_paths=fallback_raw_id_paths,
+    ):
         key = str(candidate).lower()
         if key in seen:
             continue
         seen.add(key)
-        if candidate.is_file():
+        if trusted_parent or candidate.is_file():
             found.append(candidate)
             if len(found) >= max_paths:
                 break
@@ -106,8 +146,12 @@ def load_visual_index(
     video_root: Path | None,
     modality: str,
     max_images_per_item: int,
+    max_items: int = 0,
+    fallback_raw_id_paths: bool = True,
 ) -> pd.DataFrame:
     item_map = pd.read_parquet(processed_dir / "item_id_map.parquet").sort_values("item_id")
+    if int(max_items) > 0:
+        item_map = item_map.head(int(max_items)).copy()
     notes = _read_notes(qilin_dir)
     if not notes.empty:
         notes = item_map.merge(notes, left_on="raw_item_id", right_on="note_idx", how="left")
@@ -115,6 +159,8 @@ def load_visual_index(
         notes = item_map.copy()
         notes["image_path"] = None
         notes["note_type"] = 0
+    image_dirs = _available_child_dirs(image_root)
+    video_dirs = _available_child_dirs(video_root)
 
     rows: list[dict[str, object]] = []
     for row in notes.itertuples(index=False):
@@ -124,13 +170,34 @@ def load_visual_index(
         raw_paths = getattr(row, "image_path", None)
 
         if modality == "image":
-            paths = _resolve_existing_paths(image_root, raw_item_id, raw_paths, max_images_per_item)
+            paths = _resolve_existing_paths(
+                image_root,
+                raw_item_id,
+                raw_paths,
+                max_images_per_item,
+                available_dirs=image_dirs,
+                fallback_raw_id_paths=fallback_raw_id_paths,
+            )
             source = "image_path" if paths else "missing"
         else:
-            paths = _resolve_existing_paths(video_root, raw_item_id, raw_paths, max_images_per_item)
+            paths = _resolve_existing_paths(
+                video_root,
+                raw_item_id,
+                raw_paths,
+                max_images_per_item,
+                available_dirs=video_dirs,
+                fallback_raw_id_paths=fallback_raw_id_paths,
+            )
             source = "video_root"
             if not paths and note_type == 2:
-                paths = _resolve_existing_paths(image_root, raw_item_id, raw_paths, max_images_per_item)
+                paths = _resolve_existing_paths(
+                    image_root,
+                    raw_item_id,
+                    raw_paths,
+                    max_images_per_item,
+                    available_dirs=image_dirs,
+                    fallback_raw_id_paths=fallback_raw_id_paths,
+                )
                 source = "image_cover" if paths else "missing"
             elif not paths:
                 source = "missing"
@@ -236,62 +303,301 @@ def _model_device(name: str) -> torch.device:
     return torch.device(name)
 
 
-def _encode_with_transformers(
-    items: pd.DataFrame,
+class _ImagePathDataset(Dataset):
+    def __init__(self, paths: list[Path]):
+        self.paths = [str(path) for path in paths]
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, idx: int) -> tuple[int, np.ndarray, bool]:
+        from PIL import Image
+
+        try:
+            with Image.open(self.paths[idx]) as image:
+                arr = np.asarray(image.convert("RGB"))
+            return idx, arr, True
+        except Exception:
+            return idx, np.empty((0, 0, 3), dtype=np.uint8), False
+
+
+def _collate_image_batch(batch: list[tuple[int, np.ndarray, bool]]) -> tuple[list[int], list[np.ndarray]]:
+    indices: list[int] = []
+    images: list[np.ndarray] = []
+    for idx, image, ok in batch:
+        if ok and image.size:
+            indices.append(int(idx))
+            images.append(image)
+    return indices, images
+
+
+def _load_image_array(task: tuple[int, str, int]) -> tuple[int, np.ndarray | None]:
+    from PIL import Image, ImageOps
+
+    idx, path, image_size = task
+    try:
+        with Image.open(path) as image:
+            if image_size > 0:
+                try:
+                    image.draft("RGB", (image_size, image_size))
+                except Exception:
+                    pass
+                image = ImageOps.exif_transpose(image).convert("RGB").resize(
+                    (image_size, image_size),
+                    Image.Resampling.BICUBIC,
+                )
+            else:
+                image = ImageOps.exif_transpose(image).convert("RGB")
+            return idx, np.asarray(image).copy()
+    except Exception:
+        return idx, None
+
+
+def _path_signature(path: Path) -> dict[str, object]:
+    # Qilin image shards are append-only in this workflow. Using the path as
+    # the stable cache key avoids a slow per-image stat pass on external disks.
+    return {"path": str(path), "size": -1, "mtime_ns": -1}
+
+
+def _paths_from_items(items: pd.DataFrame) -> tuple[list[Path], dict[str, list[int]]]:
+    path_to_items: dict[str, list[int]] = {}
+    for item_idx, row in enumerate(items.itertuples(index=False)):
+        seen_for_item: set[str] = set()
+        for raw_path in json.loads(getattr(row, "paths_json") or "[]"):
+            path = str(Path(raw_path))
+            key = path.lower()
+            if key in seen_for_item:
+                continue
+            seen_for_item.add(key)
+            path_to_items.setdefault(path, []).append(item_idx)
+    paths = [Path(path) for path in path_to_items]
+    return paths, path_to_items
+
+
+def _load_path_cache(cache_dir: Path | None, model_name: str) -> tuple[pd.DataFrame, np.ndarray]:
+    if cache_dir is None:
+        return pd.DataFrame(columns=["path", "size", "mtime_ns", "row"]), np.zeros((0, 0), dtype="float32")
+    index_path = cache_dir / CACHE_INDEX_NAME
+    values_path = cache_dir / CACHE_VALUES_NAME
+    meta_path = cache_dir / CACHE_META_NAME
+    if not index_path.exists() or not values_path.exists():
+        return pd.DataFrame(columns=["path", "size", "mtime_ns", "row"]), np.zeros((0, 0), dtype="float32")
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        cached_model = str(meta.get("model_name", ""))
+        if cached_model and cached_model != str(model_name):
+            raise ValueError(f"Visual cache model mismatch: {cached_model!r} != {model_name!r}")
+    index = pd.read_parquet(index_path)
+    values = np.load(values_path)
+    if "row" not in index:
+        index = index.copy()
+        index["row"] = np.arange(len(index), dtype=np.int64)
+    if len(index) != int(values.shape[0]):
+        raise ValueError(f"Visual cache index/value mismatch: {len(index)} rows vs {values.shape[0]} embeddings")
+    for col in ["path", "size", "mtime_ns", "row"]:
+        if col not in index:
+            raise ValueError(f"Visual cache index missing column: {col}")
+    return index[["path", "size", "mtime_ns", "row"]].copy(), values
+
+
+def _save_path_cache(
+    cache_dir: Path,
+    index: pd.DataFrame,
+    values: np.ndarray,
+    model_name: str,
+    save_dtype: str,
+) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    dtype = np.float16 if save_dtype == "float16" else np.float32
+    index = index[["path", "size", "mtime_ns", "row"]].copy()
+    index_tmp = cache_dir / f"{CACHE_INDEX_NAME}.tmp"
+    values_tmp = cache_dir / f"{CACHE_VALUES_NAME}.tmp.npy"
+    meta_tmp = cache_dir / f"{CACHE_META_NAME}.tmp"
+    index.to_parquet(index_tmp, index=False)
+    np.save(values_tmp, values.astype(dtype, copy=False))
+    meta = {
+        "model_name": str(model_name),
+        "embedding_dim": int(values.shape[1]) if values.ndim == 2 and values.size else 0,
+        "num_paths": int(values.shape[0]) if values.ndim == 2 else 0,
+        "save_dtype": save_dtype,
+    }
+    meta_tmp.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    index_tmp.replace(cache_dir / CACHE_INDEX_NAME)
+    values_tmp.replace(cache_dir / CACHE_VALUES_NAME)
+    meta_tmp.replace(cache_dir / CACHE_META_NAME)
+
+
+def _embedding_from_output(output: object) -> torch.Tensor:
+    if isinstance(output, torch.Tensor):
+        return output
+    if getattr(output, "pooler_output", None) is not None:
+        return output.pooler_output
+    return output.last_hidden_state[:, 0]
+
+
+def _forward_images_adaptive(
+    images: list[np.ndarray],
+    processor: object,
+    model: torch.nn.Module,
+    device: torch.device,
+    fp16: bool,
+) -> np.ndarray:
+    try:
+        inputs = processor(images=images, return_tensors="pt").to(device)
+        use_fp16 = bool(fp16 and device.type == "cuda")
+        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=use_fp16):
+            if hasattr(model, "get_image_features"):
+                output = model.get_image_features(**inputs)
+            else:
+                output = model(**inputs)
+            emb = _embedding_from_output(output)
+            emb = torch.nn.functional.normalize(emb, dim=-1)
+        return emb.detach().cpu().numpy().astype("float32")
+    except RuntimeError as exc:
+        is_oom = "out of memory" in str(exc).lower()
+        if not is_oom or len(images) <= 1:
+            raise
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        midpoint = len(images) // 2
+        left = _forward_images_adaptive(images[:midpoint], processor, model, device, fp16)
+        right = _forward_images_adaptive(images[midpoint:], processor, model, device, fp16)
+        return np.concatenate([left, right], axis=0)
+
+
+def _encode_paths_with_transformers(
+    paths: list[Path],
     model_name: str,
     batch_size: int,
     device_name: str,
-) -> tuple[np.ndarray, np.ndarray]:
+    fp16: bool,
+    image_workers: int,
+    image_size: int,
+) -> tuple[list[int], np.ndarray]:
     try:
-        from PIL import Image
         from transformers import AutoImageProcessor, AutoModel
     except ImportError as exc:
         raise SystemExit("Please install transformers and Pillow first: pip install transformers Pillow") from exc
 
-    flat: list[tuple[int, Path]] = []
-    for idx, row in enumerate(items.itertuples(index=False)):
-        for path in json.loads(getattr(row, "paths_json") or "[]"):
-            flat.append((idx, Path(path)))
-    if not flat:
-        return np.zeros((len(items), 0), dtype="float32"), np.zeros(len(items), dtype="int32")
+    if not paths:
+        return [], np.zeros((0, 0), dtype="float32")
 
     device = _model_device(device_name)
     processor = AutoImageProcessor.from_pretrained(model_name)
     model = AutoModel.from_pretrained(model_name).to(device)
     model.eval()
 
-    sums: np.ndarray | None = None
-    counts = np.zeros(len(items), dtype="int32")
-    with torch.no_grad():
-        for start in tqdm(range(0, len(flat), batch_size), desc="visual embeddings"):
-            batch = flat[start : start + batch_size]
-            images = []
-            good_indices: list[int] = []
-            for item_idx, path in batch:
-                try:
-                    with Image.open(path) as image:
-                        images.append(image.convert("RGB"))
-                    good_indices.append(item_idx)
-                except Exception:
-                    continue
+    good_path_indices: list[int] = []
+    chunks: list[np.ndarray] = []
+    workers = max(int(image_workers), 0)
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 0 else None
+    try:
+        iterator = range(0, len(paths), int(batch_size))
+        for start in tqdm(iterator, total=math.ceil(len(paths) / max(int(batch_size), 1)), desc="visual path embeddings"):
+            batch_paths = paths[start : start + int(batch_size)]
+            tasks = [(start + offset, str(path), int(image_size)) for offset, path in enumerate(batch_paths)]
+            loaded = list(executor.map(_load_image_array, tasks)) if executor is not None else [_load_image_array(task) for task in tasks]
+            batch_indices = [idx for idx, image in loaded if image is not None]
+            images = [image for _, image in loaded if image is not None]
             if not images:
                 continue
-            inputs = processor(images=images, return_tensors="pt").to(device)
-            if hasattr(model, "get_image_features"):
-                emb = model.get_image_features(**inputs)
-            else:
-                out = model(**inputs)
-                emb = out.pooler_output if getattr(out, "pooler_output", None) is not None else out.last_hidden_state[:, 0]
-            if not isinstance(emb, torch.Tensor):
-                emb = emb.pooler_output if getattr(emb, "pooler_output", None) is not None else emb.last_hidden_state[:, 0]
-            emb = torch.nn.functional.normalize(emb, dim=-1).cpu().numpy().astype("float32")
-            if sums is None:
-                sums = np.zeros((len(items), emb.shape[1]), dtype="float32")
-            for item_idx, vec in zip(good_indices, emb):
-                sums[item_idx] += vec
-                counts[item_idx] += 1
-    if sums is None:
-        return np.zeros((len(items), 0), dtype="float32"), counts
+            emb = _forward_images_adaptive(images, processor, model, device, fp16=fp16)
+            good_path_indices.extend(batch_indices)
+            chunks.append(emb)
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=True)
+    if not chunks:
+        return [], np.zeros((0, 0), dtype="float32")
+    return good_path_indices, np.concatenate(chunks, axis=0)
+
+
+def _encode_with_transformers(
+    items: pd.DataFrame,
+    model_name: str,
+    batch_size: int,
+    device_name: str,
+    cache_dir: Path | None = None,
+    fp16: bool = False,
+    image_workers: int = 0,
+    cache_save_dtype: str = "float16",
+    image_size: int = 224,
+) -> tuple[np.ndarray, np.ndarray]:
+    unique_paths, path_to_items = _paths_from_items(items)
+    if not unique_paths:
+        return np.zeros((len(items), 0), dtype="float32"), np.zeros(len(items), dtype="int32")
+
+    signatures = []
+    for path in unique_paths:
+        try:
+            signatures.append(_path_signature(path))
+        except OSError:
+            continue
+    current = pd.DataFrame(signatures)
+    if current.empty:
+        return np.zeros((len(items), 0), dtype="float32"), np.zeros(len(items), dtype="int32")
+
+    cache_index, cache_values = _load_path_cache(cache_dir, model_name=model_name)
+    cached_lookup = {
+        (str(row.path), int(row.size), int(row.mtime_ns)): int(row.row)
+        for row in cache_index.itertuples(index=False)
+    }
+    missing_mask = [
+        (str(row.path), int(row.size), int(row.mtime_ns)) not in cached_lookup
+        for row in current.itertuples(index=False)
+    ]
+    missing = current.loc[missing_mask].reset_index(drop=True)
+    newly_encoded_paths = 0
+    if not missing.empty:
+        missing_paths = [Path(path) for path in missing["path"].tolist()]
+        good_missing_indices, new_values = _encode_paths_with_transformers(
+            missing_paths,
+            model_name=model_name,
+            batch_size=batch_size,
+            device_name=device_name,
+            fp16=fp16,
+            image_workers=image_workers,
+            image_size=image_size,
+        )
+        if good_missing_indices:
+            good_missing = missing.iloc[good_missing_indices].copy().reset_index(drop=True)
+            if cache_values.size and int(cache_values.shape[1]) != int(new_values.shape[1]):
+                raise ValueError(
+                    f"Visual cache embedding dim mismatch: {cache_values.shape[1]} != {new_values.shape[1]}"
+                )
+            start_row = int(cache_values.shape[0]) if cache_values.size else 0
+            good_missing["row"] = np.arange(start_row, start_row + len(good_missing), dtype=np.int64)
+            cache_index = pd.concat([cache_index, good_missing[["path", "size", "mtime_ns", "row"]]], ignore_index=True)
+            cache_values = new_values if not cache_values.size else np.concatenate([cache_values, new_values], axis=0)
+            newly_encoded_paths = len(good_missing)
+            if cache_dir is not None:
+                _save_path_cache(cache_dir, cache_index, cache_values, model_name, cache_save_dtype)
+
+    path_row_lookup = {
+        str(row.path): int(row.row)
+        for row in cache_index.itertuples(index=False)
+        if Path(str(row.path)).exists()
+    }
+    raw_dim = int(cache_values.shape[1]) if cache_values.ndim == 2 and cache_values.size else 0
+    if raw_dim == 0:
+        return np.zeros((len(items), 0), dtype="float32"), np.zeros(len(items), dtype="int32")
+
+    sums = np.zeros((len(items), raw_dim), dtype="float32")
+    counts = np.zeros(len(items), dtype="int32")
+    for path, item_indices in path_to_items.items():
+        row_idx = path_row_lookup.get(path)
+        if row_idx is None:
+            continue
+        vec = cache_values[row_idx].astype("float32", copy=False)
+        for item_idx in item_indices:
+            sums[item_idx] += vec
+            counts[item_idx] += 1
+
+    print(
+        "visual cache "
+        f"unique_paths={len(unique_paths)} cached={len(unique_paths) - len(missing)} "
+        f"newly_encoded={newly_encoded_paths} cache_dir={cache_dir or ''}"
+    )
     nonzero = counts > 0
     sums[nonzero] = sums[nonzero] / counts[nonzero, None]
     return _normalize_rows(sums), counts
@@ -345,9 +651,9 @@ def build_embeddings_for_modality(args: argparse.Namespace, modality: str) -> di
         video_root=video_root,
         modality=modality,
         max_images_per_item=int(args.max_images_per_item),
+        max_items=int(args.max_items),
+        fallback_raw_id_paths=bool(getattr(args, "fallback_raw_id_paths", False) or not getattr(args, "qilin_dir", None)),
     )
-    if args.max_items and int(args.max_items) > 0:
-        items = items.head(int(args.max_items)).copy()
 
     encoder_name = str(getattr(args, "encoder", "transformers"))
     if encoder_name == "mock" or bool(getattr(args, "mock_encoder", False)):
@@ -361,6 +667,11 @@ def build_embeddings_for_modality(args: argparse.Namespace, modality: str) -> di
             model_name=str(args.model_name),
             batch_size=int(args.batch_size),
             device_name=str(args.device),
+            cache_dir=Path(args.cache_dir) if getattr(args, "cache_dir", None) else None,
+            fp16=bool(getattr(args, "fp16", False)),
+            image_workers=int(getattr(args, "image_workers", 0)),
+            cache_save_dtype=str(getattr(args, "cache_save_dtype", "float16")),
+            image_size=int(getattr(args, "image_size", 224)),
         )
 
     if raw_values.shape[1] == 0:
@@ -413,6 +724,122 @@ def build_embeddings_for_modality(args: argparse.Namespace, modality: str) -> di
     return summary
 
 
+def apply_visual_sidecar_metadata(processed_dir: Path, summaries: list[dict[str, object]]) -> None:
+    meta_path = processed_dir / "metadata.json"
+    if not meta_path.exists():
+        raise FileNotFoundError(f"Missing metadata.json in {processed_dir}")
+    metadata = json.loads(meta_path.read_text(encoding="utf-8"))
+    sidecars = metadata.get("feature_sidecars", {})
+    if not isinstance(sidecars, dict):
+        sidecars = {}
+    for summary in summaries:
+        modality = str(summary["modality"])
+        dim = int(summary["embedding_dim"])
+        if modality == "image":
+            metadata["image_emb_dim"] = dim
+            sidecars["image_emb"] = {
+                "source": "image",
+                "id_col": "item_id",
+                "values": "image_embeddings.npy",
+                "ids": "image_embedding_item_ids.npy",
+                "dim": dim,
+            }
+        elif modality == "video":
+            metadata["video_emb_dim"] = dim
+            sidecars["video_emb"] = {
+                "source": "video",
+                "id_col": "item_id",
+                "values": "video_embeddings.npy",
+                "ids": "video_embedding_item_ids.npy",
+                "dim": dim,
+            }
+    metadata["feature_sidecars"] = sidecars
+    metadata.pop("visual_sidecar_source", None)
+    metadata["visual_embedding_source"] = "build_visual_embeddings"
+    meta_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def visual_sidecar_ready(processed_dir: Path, modality: str) -> bool:
+    processed_dir = Path(processed_dir)
+    values = processed_dir / f"{modality}_embeddings.npy"
+    ids = processed_dir / f"{modality}_embedding_item_ids.npy"
+    return values.exists() and ids.exists()
+
+
+def build_visual_embeddings_for_processed(
+    processed_dir: Path,
+    *,
+    image_root: Path | None = None,
+    video_root: Path | None = None,
+    qilin_dir: Path | None = None,
+    modalities: tuple[str, ...] = ("image", "video"),
+    model_name: str = "openai/clip-vit-base-patch32",
+    output_dim: int = 128,
+    compression: str = "auto",
+    batch_size: int = 32,
+    device: str = "auto",
+    cache_dir: Path | None = None,
+    fp16: bool = False,
+    image_workers: int = 0,
+    cache_save_dtype: str = "float16",
+    image_size: int = 224,
+    max_images_per_item: int = 4,
+    max_items: int = 0,
+    save_dtype: str = "float32",
+    seed: int = 2026,
+    encoder: str = "transformers",
+    mock_encoder: bool = False,
+    mock_dim: int = 512,
+    handcrafted_dim: int = 64,
+    fallback_raw_id_paths: bool = False,
+    skip_existing: bool = True,
+    update_metadata: bool = True,
+) -> list[dict[str, object]]:
+    processed_dir = Path(processed_dir)
+    summaries: list[dict[str, object]] = []
+    for modality in modalities:
+        if skip_existing and visual_sidecar_ready(processed_dir, modality):
+            summary_path = processed_dir / f"{modality}_embedding_summary.json"
+            if summary_path.exists():
+                summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
+                print(f"skip existing {modality} embeddings in {processed_dir}")
+                continue
+        args = argparse.Namespace(
+            processed_dir=str(processed_dir),
+            image_root=str(image_root) if image_root else None,
+            video_root=str(video_root) if video_root else None,
+            qilin_dir=str(qilin_dir) if qilin_dir else None,
+            model_name=model_name,
+            output_dim=output_dim,
+            compression=compression,
+            batch_size=batch_size,
+            device=device,
+            cache_dir=str(cache_dir) if cache_dir else None,
+            fp16=fp16,
+            image_workers=image_workers,
+            cache_save_dtype=cache_save_dtype,
+            image_size=image_size,
+            max_images_per_item=max_images_per_item,
+            max_items=max_items,
+            save_dtype=save_dtype,
+            seed=seed,
+            encoder=encoder,
+            mock_encoder=mock_encoder,
+            mock_dim=mock_dim,
+            handcrafted_dim=handcrafted_dim,
+            fallback_raw_id_paths=fallback_raw_id_paths,
+        )
+        summaries.append(build_embeddings_for_modality(args, modality))
+    if summaries:
+        (processed_dir / "visual_embedding_summary.json").write_text(
+            json.dumps({"modalities": summaries}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        if update_metadata:
+            apply_visual_sidecar_metadata(processed_dir, summaries)
+    return summaries
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Build parameter-friendly image/video thumbnail embeddings for processed Qilin items."
@@ -433,6 +860,26 @@ def main() -> None:
     parser.add_argument("--compression", choices=["auto", "pca", "random", "none"], default="auto")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", default="auto")
+    parser.add_argument("--cache-dir", default=None, help="Persistent raw visual path embedding cache directory.")
+    parser.add_argument(
+        "--cache-save-dtype",
+        choices=["float32", "float16"],
+        default="float16",
+        help="Storage dtype for cached raw SigLIP/CLIP path embeddings.",
+    )
+    parser.add_argument("--fp16", action="store_true", help="Use CUDA autocast float16 for transformer image encoding.")
+    parser.add_argument("--image-workers", type=int, default=0, help="Parallel image loading workers for transformer encoding.")
+    parser.add_argument(
+        "--image-size",
+        type=int,
+        default=224,
+        help="Pre-resize images before processor; 224 matches SigLIP/CLIP ViT-B defaults. Use 0 to disable.",
+    )
+    parser.add_argument(
+        "--fallback-raw-id-paths",
+        action="store_true",
+        help="Also probe image_root/{raw_item_id}.jpg style paths. Disabled by default for Qilin part_x images.",
+    )
     parser.add_argument("--max-images-per-item", type=int, default=4)
     parser.add_argument("--max-items", type=int, default=0, help="Optional debug limit.")
     parser.add_argument("--save-dtype", choices=["float32", "float16"], default="float32")
@@ -443,11 +890,33 @@ def main() -> None:
     args = parser.parse_args()
 
     modalities = ["image", "video"] if args.modality == "both" else [args.modality]
-    summaries = [build_embeddings_for_modality(args, modality) for modality in modalities]
-    processed_dir = Path(args.processed_dir)
-    (processed_dir / "visual_embedding_summary.json").write_text(
-        json.dumps({"modalities": summaries}, ensure_ascii=False, indent=2),
-        encoding="utf-8",
+    build_visual_embeddings_for_processed(
+        Path(args.processed_dir),
+        image_root=Path(args.image_root) if args.image_root else None,
+        video_root=Path(args.video_root) if args.video_root else None,
+        qilin_dir=Path(args.qilin_dir) if args.qilin_dir else None,
+        modalities=tuple(modalities),
+        model_name=str(args.model_name),
+        output_dim=int(args.output_dim),
+        compression=str(args.compression),
+        batch_size=int(args.batch_size),
+        device=str(args.device),
+        cache_dir=Path(args.cache_dir) if args.cache_dir else None,
+        fp16=bool(args.fp16),
+        image_workers=int(args.image_workers),
+        cache_save_dtype=str(args.cache_save_dtype),
+        image_size=int(args.image_size),
+        max_images_per_item=int(args.max_images_per_item),
+        max_items=int(args.max_items),
+        save_dtype=str(args.save_dtype),
+        seed=int(args.seed),
+        encoder=str(args.encoder),
+        mock_encoder=bool(args.mock_encoder),
+        mock_dim=int(args.mock_dim),
+        handcrafted_dim=int(args.handcrafted_dim),
+        fallback_raw_id_paths=bool(args.fallback_raw_id_paths or not args.qilin_dir),
+        skip_existing=False,
+        update_metadata=True,
     )
 
 

@@ -1,23 +1,54 @@
-﻿# Python/runtime
+﻿# Python / runtime
 .venv/
 __pycache__/
 *.py[cod]
 .pytest_cache/
+*.egg-info/
+dist/
+build/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 # Local IDE metadata
 .idea/
+.vscode/*
+!.vscode/settings.json
+*.swp
+*~
 
 # Large local datasets and generated artifacts
 data/raw/
 data/processed/
 outputs/
+embeddings/
 *.pt
 *.pth
 *.ckpt
 *.npy
 *.npz
 *.parquet
+*.mmap
 
-# Local logs/caches
+# Experiment / training logs
 *.log
 .cache/
+wandb/
+mlruns/
+lightning_logs/
+
+# OS junk
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Personal scratch notes (repo root only; docs under docs/ are still tracked)
+/之后计划.txt
+/优化思路.txt
+/提取结果_*.txt
+/新建文本文档.txt
+
+# Papers and competition attachments (large binaries)
+*.pdf
+/赛题二论文/

@@ -19,6 +19,9 @@ from heterointent.utils import count_parameters, read_json, resolve_device, set_
 
 
 def _move_batch(batch: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
+    sample = next(iter(batch.values()))
+    if sample.device.type == device.type:
+        return batch
     non_blocking = device.type == "cuda"
     return {k: v.to(device, non_blocking=non_blocking) for k, v in batch.items()}
 
@@ -48,8 +51,8 @@ def predict_frame(model: nn.Module, loader, device: torch.device) -> pd.DataFram
     for batch in loader:
         batch = _move_batch(batch, device)
         outputs = model(batch)
-        probs = outputs["probs"].detach().cpu().numpy()
-        scores = outputs["final_score"].detach().cpu().numpy()
+        probs = torch.nan_to_num(outputs["probs"], nan=0.0, posinf=1.0, neginf=0.0).detach().cpu().numpy()
+        scores = torch.nan_to_num(outputs["final_score"], nan=0.0).detach().cpu().numpy()
         labels = batch["labels"].detach().cpu().numpy()
         frame = pd.DataFrame(
             {
@@ -125,9 +128,23 @@ def _load_history(output_dir: Path) -> list[dict]:
     return pd.read_csv(metrics_path).to_dict("records")
 
 
-def _best_metric_from_history(history: list[dict]) -> float:
-    values = [float(row.get("weighted_hit@20", -1.0)) for row in history if pd.notna(row.get("weighted_hit@20", None))]
+def _metric_value(row: dict, metric_name: str) -> float:
+    value = row.get(metric_name)
+    if value is None or not pd.notna(value):
+        value = row.get("weighted_hit@20", -1.0)
+    value = float(value)
+    return value if np.isfinite(value) else -1.0
+
+
+def _best_metric_from_history(history: list[dict], metric_name: str = "quality_score") -> float:
+    values = [_metric_value(row, metric_name) for row in history]
     return max(values) if values else -1.0
+
+
+def _best_record_from_history(history: list[dict], metric_name: str) -> dict:
+    if not history:
+        return {}
+    return max(history, key=lambda row: _metric_value(row, metric_name))
 
 
 def train(config: dict, resume_path: str | None = None) -> dict:
@@ -153,15 +170,18 @@ def train(config: dict, resume_path: str | None = None) -> dict:
         pin_memory=bool(data_cfg.get("pin_memory", device.type == "cuda")),
         fast_loader=bool(data_cfg.get("fast_loader", False)),
         request_preserving=bool(data_cfg.get("request_preserving_train", data_cfg.get("request_preserving", False))),
+        tensor_device=str(data_cfg.get("tensor_device", "")) or None,
     )
+    eval_batch_size = int(data_cfg.get("eval_batch_size", data_cfg.get("batch_size", 256)))
     valid_loader = build_dataloader(
         processed_dir / data_cfg.get("valid_file", "valid.parquet"),
         metadata,
-        batch_size=int(data_cfg.get("batch_size", 256)),
+        batch_size=eval_batch_size,
         shuffle=False,
         num_workers=int(data_cfg.get("num_workers", 0)),
         pin_memory=bool(data_cfg.get("pin_memory", device.type == "cuda")),
-        fast_loader=bool(data_cfg.get("fast_loader", False)),
+        fast_loader=bool(data_cfg.get("eval_fast_loader", data_cfg.get("fast_loader", False))),
+        tensor_device=str(data_cfg.get("tensor_device", "")) or None,
     )
 
     model = HeteroIntentPLE(metadata, config).to(device)
@@ -182,6 +202,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
     history: list[dict] = []
     epochs = int(config["train"].get("epochs", 10))
     topk = int(config["evaluation"].get("topk", 20))
+    selection_metric = str(config.get("evaluation", {}).get("selection_metric", "quality_score"))
     start_epoch = 1
     best_metric = -1.0
     save_every_epoch = bool(config["train"].get("save_every_epoch", False))
@@ -190,7 +211,11 @@ def train(config: dict, resume_path: str | None = None) -> dict:
         checkpoint = torch.load(resume_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model"])
         history = list(checkpoint.get("history") or _load_history(output_dir))
-        best_metric = float(checkpoint.get("best_metric", _best_metric_from_history(history)))
+        checkpoint_selection_metric = str(checkpoint.get("selection_metric", checkpoint.get("selection_metric_name", selection_metric)))
+        if checkpoint_selection_metric == selection_metric:
+            best_metric = float(checkpoint.get("best_metric", _best_metric_from_history(history, selection_metric)))
+        else:
+            best_metric = _best_metric_from_history(history, selection_metric)
         stale = int(checkpoint.get("stale", 0))
         if "optimizer" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer"])
@@ -202,7 +227,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
             start_epoch = int(checkpoint["epoch"]) + 1
         elif history:
             start_epoch = int(max(row.get("epoch", 0) for row in history)) + 1
-        print(f"Resumed from {resume_path}; next epoch = {start_epoch}; best_weighted_hit@20 = {best_metric:.6f}")
+        print(f"Resumed from {resume_path}; next epoch = {start_epoch}; best_{selection_metric} = {best_metric:.6f}")
 
     for epoch in range(start_epoch, epochs + 1):
         model.train()
@@ -241,7 +266,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
         history.append(record)
         pd.DataFrame(history).to_csv(output_dir / "metrics.csv", index=False)
 
-        metric = metrics.get("weighted_hit@20", 0.0)
+        metric = _metric_value(metrics, selection_metric)
         improved = metric > best_metric
         if improved:
             best_metric = metric
@@ -257,6 +282,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
             "config": to_plain_dict(config),
             "epoch": epoch,
             "best_metric": best_metric,
+            "selection_metric": selection_metric,
             "stale": stale,
             "history": history,
         }
@@ -270,13 +296,17 @@ def train(config: dict, resume_path: str | None = None) -> dict:
         elif epoch >= min_epochs and stale >= patience:
             break
 
-    write_json(
-        {
-            "best_weighted_hit@20": best_metric,
-            "num_parameters": count_parameters(model),
-            "device": str(device),
-            "last_epoch": int(history[-1]["epoch"]) if history else 0,
-        },
-        output_dir / "summary.json",
-    )
-    return {"output_dir": str(output_dir), "best_weighted_hit@20": best_metric}
+    best_record = _best_record_from_history(history, selection_metric)
+    summary = {
+        "selection_metric": selection_metric,
+        "best_metric": best_metric,
+        "best_selection_metric": _metric_value(best_record, selection_metric) if best_record else best_metric,
+        "best_epoch": int(best_record.get("epoch", 0)) if best_record else 0,
+        "best_weighted_hit@20": float(best_record.get("weighted_hit@20", float("nan"))) if best_record else float("nan"),
+        "best_quality_score": float(best_record.get("quality_score", float("nan"))) if best_record else float("nan"),
+        "num_parameters": count_parameters(model),
+        "device": str(device),
+        "last_epoch": int(history[-1]["epoch"]) if history else 0,
+    }
+    write_json(summary, output_dir / "summary.json")
+    return {"output_dir": str(output_dir), **summary}

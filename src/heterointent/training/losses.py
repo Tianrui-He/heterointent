@@ -264,6 +264,9 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
     type_transition_weight = float(cfg.get("type_transition_weight", legacy_transition_weight))
     taxonomy_transition_weight = float(cfg.get("taxonomy_transition_weight", 0.0))
     contrastive_weight = float(cfg.get("contrastive_weight", 0.05))
+    aux_like_weight = float(cfg.get("aux_like_weight", 0.0))
+    aux_comment_weight = float(cfg.get("aux_comment_weight", 0.0))
+    aux_page_time_weight = float(cfg.get("aux_page_time_weight", 0.0))
 
     bpr = (
         request_bpr_loss(
@@ -338,6 +341,34 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         if contrastive_weight > 0 and "text_repr" in outputs and "image_repr" in outputs
         else logits.new_tensor(0.0)
     )
+    aux_like = (
+        focal_bce_with_logits(
+            outputs["aux_like_logit"].unsqueeze(-1),
+            batch["aux_labels"][:, :1],
+            gamma=float(cfg.get("focal_gamma", 1.5)),
+            positive_weights=torch.tensor([float(cfg.get("aux_like_pos_weight", 4.0))], dtype=logits.dtype, device=logits.device),
+        ).mean()
+        if aux_like_weight > 0 and "aux_like_logit" in outputs and "aux_labels" in batch
+        else logits.new_tensor(0.0)
+    )
+    aux_comment = (
+        focal_bce_with_logits(
+            outputs["aux_comment_logit"].unsqueeze(-1),
+            batch["aux_labels"][:, 1:2],
+            gamma=float(cfg.get("focal_gamma", 1.5)),
+            positive_weights=torch.tensor([float(cfg.get("aux_comment_pos_weight", 6.0))], dtype=logits.dtype, device=logits.device),
+        ).mean()
+        if aux_comment_weight > 0 and "aux_comment_logit" in outputs and "aux_labels" in batch
+        else logits.new_tensor(0.0)
+    )
+    page_time_mask = None
+    if "page_time_log" in batch:
+        page_time_mask = (batch["labels"][:, 0] > 0) | (batch["page_time_log"] > 0)
+    aux_page_time = (
+        F.smooth_l1_loss(outputs["aux_page_time"][page_time_mask], batch["page_time_log"][page_time_mask])
+        if aux_page_time_weight > 0 and "aux_page_time" in outputs and page_time_mask is not None and bool(page_time_mask.any())
+        else logits.new_tensor(0.0)
+    )
     total = (
         task_loss
         + bpr_weight * bpr
@@ -348,6 +379,9 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         + type_transition_weight * type_transition
         + taxonomy_transition_weight * taxonomy_transition
         + contrastive_weight * contrastive
+        + aux_like_weight * aux_like
+        + aux_comment_weight * aux_comment
+        + aux_page_time_weight * aux_page_time
     )
     logs = {
         "loss": total.detach(),
@@ -364,5 +398,8 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         "type_transition_loss": type_transition.detach(),
         "taxonomy_transition_loss": taxonomy_transition.detach(),
         "contrastive_loss": contrastive.detach(),
+        "aux_like_loss": aux_like.detach(),
+        "aux_comment_loss": aux_comment.detach(),
+        "aux_page_time_loss": aux_page_time.detach(),
     }
     return total, logs

@@ -1,160 +1,94 @@
 # HeteroIntent-PLE
 
-面向 Qilin 多源异构内容推荐的精排系统。模型对同一 `request_id` 下的候选 item 同时预测：
-
-```text
-p_click, p_collect, p_share
-```
-
-最终排序分数为：
+面向 Qilin 多源异构内容推荐的精排系统。模型对同一 `request_id` 下的候选 item 同时预测 `p_click`、`p_collect`、`p_share`，并按任务权重融合为最终排序分数：
 
 ```text
 score = 0.3 * p_click + 0.4 * p_collect + 0.3 * p_share
 ```
 
-当前主线版本是 **大 PLE 多目标模型 + parquet 元信息多模态统一表征**。由于本地没有真实图片/视频文件，图像和视频模态暂时来自 Qilin `notes` 表中的结构化元信息，例如 `image_path`、`image_num`、`note_type`、`video_duration`、`video_height`、`video_width`。
+当前**推荐主线**为 **Feature-Opt v2 + Compact 数据布局 + SigLIP 视觉 sidecar + 大 PLE 多目标训练**。文本/查询向量以 mmap sidecar 方式加载，避免 parquet 内嵌 512 维列导致 IO 与磁盘膨胀；视觉向量从离线 SigLIP 编码结果挂载，不重复跑文本 embedding。
 
-## 当前版本
+---
 
-| 项目 | 路径或数值 |
-| --- | --- |
-| 配置文件 | `configs/qilin_full.yaml` |
-| 处理后数据 | `data/processed/qilin_full_multimodal_meta` |
-| 训练输出 | `outputs/qilin_full_multimodal_meta` |
-| 最优 checkpoint | `outputs/qilin_full_multimodal_meta/best.pt` |
-| Top-20 文件 | `outputs/qilin_full_multimodal_meta/submission_top20_dedup.csv` |
-| 参数量 | 155,110,672 |
-| 最佳验证轮次 | epoch 4 |
-| 完成训练轮数 | 12 |
+## 当前版本一览
 
-当前配置要点：
 
-```yaml
-model:
-  hidden_dim: 512
-  shared_experts: 8
-  task_experts: 4
-  ple_layers: 3
+| 项目            | 路径或数值                                                                     |
+| ------------- | ------------------------------------------------------------------------- |
+| 主配置           | `configs/qilin_feature_opt_v2_history_compact.yaml`                       |
+| 处理后数据         | `data/processed/qilin_full_feature_opt_v2_compact`                        |
+| 训练输出          | `outputs/qilin_feature_opt_v2_history_compact`                            |
+| 最优 checkpoint | `outputs/qilin_feature_opt_v2_history_compact/best.pt`                    |
+| 测试指标          | `outputs/qilin_feature_opt_v2_history_compact/test_metrics.json`          |
+| Gate 诊断       | `outputs/qilin_feature_opt_v2_history_compact/test_gate_metrics.json`     |
+| Top-20 提交     | `outputs/qilin_feature_opt_v2_history_compact/submission_top20_dedup.csv` |
+| 展示台数据         | `outputs/showcase_feature_opt_v2_compact`                                 |
+| 参数量           | 155,091,782                                                               |
+| 最佳验证轮次        | epoch 5（按 `quality_score` 选模）                                             |
+| 完成训练轮数        | 8（早停）                                                                     |
 
-loss:
-  bpr_weight: 0.01
-  task_bpr_weight: 0.005
-  contrastive_weight: 0.0
 
-data:
-  processed_dir: data/processed/qilin_full_multimodal_meta
+### 最新测试集指标（best.pt）
 
-train:
-  output_dir: outputs/qilin_full_multimodal_meta
-```
 
-## 最新指标
+| 指标                  | Test   |
+| ------------------- | ------ |
+| quality_score       | 0.6381 |
+| WeightedHit@20      | 0.3228 |
+| NDCG@20             | 0.7290 |
+| Preference AUC      | 0.7171 |
+| Request AUC Collect | 0.7999 |
+| Request AUC Share   | 0.7698 |
 
-验证集最佳结果来自 `outputs/qilin_full_multimodal_meta/metrics.csv` 的第 4 轮。
 
-| 指标 | Valid | Test |
-| --- | ---: | ---: |
-| WeightedHit@20 | 0.242119 | 0.321044 |
-| NDCG@20 | 0.520923 | 0.674518 |
-| HitClick@20 | 0.755382 | 0.992803 |
-| HitCollect@20 | 0.029133 | 0.046064 |
-| HitShare@20 | 0.012838 | 0.015924 |
-| AUC Click | 0.680019 | 0.696142 |
-| AUC Collect | 0.817309 | 0.800443 |
-| AUC Share | 0.682769 | 0.675038 |
+相对无视觉 embedding 的 `feature_opt_v2` 非 compact 版本，同测试集上 NDCG@20 约 **+2.7%**（0.730 vs 0.703），`quality_score` 约 **+2.8%**。
 
-与原始 `outputs/qilin_full` baseline 相比，当前多模态元信息版在测试集上：
+### Top-20 模态 gate（分组口径）
 
-| 指标 | 变化 |
-| --- | ---: |
-| WeightedHit@20 | -0.000234 |
-| NDCG@20 | +0.019684 |
-| HitCollect@20 | +0.000090 |
-| AUC Click | +0.037177 |
-| AUC Share | +0.013644 |
+评估脚本按 `item_dense + ratio` 合并为 dense，`text_fused` 为 text：
 
-结论：当前多模态元信息主要改善排序位置质量和部分 AUC，尚未带来主指标 `WeightedHit@20` 的提升。真实图片/视频 embedding 缺失是主要限制。
 
-## 模型设计
+| 模态         | Top-20 gate |
+| ---------- | ----------- |
+| graph      | 0.2909      |
+| dense      | 0.3391      |
+| text       | 0.1328      |
+| video-meta | 0.0524      |
+| image-meta | 0.0112      |
+| image-emb  | ≈0          |
+| video-emb  | 0.0008      |
 
-### 1. 多模态统一表征
 
-`scripts/prepare_qilin.py` 会在 Qilin 转换阶段生成：
+`image_emb` 权重极低，因当前仅 **91,566 / 945,683（9.7%）** item 有 SigLIP 向量，且 Top-20 候选命中率低。
 
-- `image_feat_*`：由 `image_num`、`image_path` 数量、是否多图、路径 hash bucket 等元信息构成。
-- `video_feat_*`：由 `note_type`、视频时长、分辨率、面积、宽高比、是否横屏/竖屏等元信息构成。
-- `dense_feat_*`：保留原始统计特征，不破坏 baseline。
+---
 
-`ItemEncoder` 会把 item ID、类目、位置、text、image-meta、video-meta、dense、graph 分别投影到统一向量空间，再通过 gate fusion 得到 item 表征。缺失模态会被 mask 掉，特征全 0 的 image/video 不参与 softmax 融合。
+## 环境准备
 
-评估输出中会统计 `mean_gate_*` 和 `top20_mean_gate_*`。最近一次测试集中 Top-20 平均 gate 大致为：
-
-| 模态 | Top-20 gate |
-| --- | ---: |
-| graph | 0.504662 |
-| dense | 0.238981 |
-| text | 0.076525 |
-| video-meta | 0.061091 |
-| image-meta | 0.036860 |
-
-### 2. 动态意图理解
-
-数据转换阶段会基于历史 item 类型和类目生成动态意图字段，例如：
-
-```text
-target_item_type, target_taxonomy_id,
-hist_dominant_item_type, hist_dominant_taxonomy_id,
-is_type_shift, is_taxonomy_shift, has_intent_target,
-hist_item_type_*, hist_taxonomy_id_*
-```
-
-模型通过 `type_transition_head` 和 `taxonomy_transition_head` 预测用户意图转移。当前配置中：
-
-```yaml
-type_transition_weight: 0.03
-taxonomy_transition_weight: 0.03
-```
-
-### 3. 多目标联合优化
-
-训练目标由三任务 BCE/Focal BCE、加权排序 BPR、分任务 BPR 和动态意图辅助损失组成：
-
-```text
-L = task BCE/Focal
-  + bpr_weight * request-level weighted BPR
-  + task_bpr_weight * per-task BPR
-  + type_transition_weight * CE(type)
-  + taxonomy_transition_weight * CE(taxonomy)
-```
-
-当前 collect/share 是稀疏高价值行为，因此配置中保留正样本加权：
-
-```yaml
-positive_weights:
-  click: 1.0
-  collect: 4.0
-  share: 3.0
-```
-
-## 环境
-
-推荐使用已经验证可用的 Conda CUDA 环境：
+推荐使用已验证的 Conda CUDA 环境（不要用项目内 CPU 版 `.venv` 跑全量训练）：
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe
+$PY = "D:\adaconda3\envs\MiniOneRec-pre\python.exe"
+cd C:\Users\31278\Desktop\heterointent
 ```
 
 检查 GPU：
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
+& $PY -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0))"
 ```
 
-不要使用项目 `.venv` 跑全量训练，因为其中可能是 CPU 版 PyTorch。
+安装依赖（若尚未安装）：
 
-## 数据目录
+```powershell
+& $PY -m pip install -r requirements.txt
+```
 
-原始 Qilin 数据应放在：
+---
+
+## 目录结构
+
+### 原始数据
 
 ```text
 data/raw/Qilin/
@@ -164,84 +98,214 @@ data/raw/Qilin/
   user_feat/*.parquet
 ```
 
-当前主线 processed 目录：
+### 主线 processed（compact）
 
 ```text
-data/processed/qilin_full_multimodal_meta/
-  train.parquet
-  valid.parquet
-  test.parquet
+data/processed/qilin_full_feature_opt_v2_compact/
+  train.parquet / valid.parquet / test.parquet   # 精简列，无内嵌 512 维 text/query
   metadata.json
-  item_id_map.parquet
-  user_id_map.parquet
-  taxonomy_id_map.parquet
-  text_embeddings.npy
-  text_embedding_item_ids.npy
-  text_embedding_items.parquet
+  item_id_map.parquet / user_id_map.parquet / ...
+  text_embeddings.npy + text_embedding_item_ids.npy
+  text_title_embeddings.npy / text_content_embeddings.npy
+  query_embeddings.npy + query_embedding_request_ids.npy
+  image_embeddings.npy / video_embeddings.npy     # 视觉 sidecar（可选）
   graph_embedding.npy
+  compact_summary.json
+  visual_sidecar_attach.json                      # 记录视觉 sidecar 来源
 ```
 
-## 运行流程
+### 本地图片根目录（视觉编码用）
 
-以下命令均在项目根目录执行：
-
-```powershell
-cd C:\Users\31278\Desktop\heterointent
+```text
+E:\qilin\mnt\ali-sh-1\usr\lihaitao\process_0106\image\
+  part_0/ ... part_50/
 ```
 
-### 1. 转换 Qilin 数据
+当前已编码路径仅覆盖 `**part_0`–`part_29**`（由 `notes.image_path` 决定，不是扫描全部分片）。
 
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\prepare_qilin.py --qilin-dir data\raw\Qilin --output-dir data\processed\qilin_full_multimodal_meta --max-history 20 --text-hash-dim 0
+---
+
+## 完整操作流程
+
+以下命令均在**项目根目录**执行。脚本会自动把 `src` 加入 `PYTHONPATH`。
+
+### 流程总览
+
+```text
+[一次性] 原始 Qilin → feature_opt_v2 全量 processed
+    ↓
+[推荐一步] build_processed_compact.py
+           = 文本/查询 embedding（可跳过已有）
+           + 从本地图片路径 SigLIP 视觉 embedding
+           + compact 精简 parquet
+    ↓
+训练 → 验证/测试评估 → Top-20 导出 → Gate 诊断 → 展示台
 ```
 
-### 2. 生成文本 embedding
+若你已有 `data/processed/qilin_full_feature_opt_v2_compact` 且 sidecar 齐全，可从 **步骤 3** 直接训练。
+
+视觉向量**直接从 `notes.image_path` + `--image-root` 解析文件并编码**，不复制其他实验目录的 sidecar。
+
+---
+
+### 步骤 1：转换 Qilin 为 processed（首次）
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --model-name D:\models\bge-small-zh-v1.5 --batch-size 256 --max-length 256 --pooling cls --device cuda
-```
-这一阶段需要为约 94.6 万个 item 生成文本向量，耗时明显长于单轮训练是正常现象。BGE 系列建议使用 `--pooling cls`；如果换回 Qwen 等通用 Transformer，可以使用默认的 `--pooling mean`。
-
-```powershell
---pooling cls
-```
-
-### 3. 合并文本 embedding
-
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\merge_embeddings.py --processed-dir data\processed\qilin_full_multimodal_meta --text
-```
-
-### 4. 构建 item graph
-
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_item_graph.py --processed-dir data\processed\qilin_full_multimodal_meta --embed-dim 64
+& $PY scripts\prepare_qilin.py `
+  --qilin-dir data\raw\Qilin `
+  --output-dir data\processed\qilin_full_feature_opt `
+  --max-history 20 `
+  --text-hash-dim 0
 ```
 
-### 5. 训练
+构建 item graph（全量 processed 上执行一次即可，compact 会继承）：
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml
+& $PY scripts\build_item_graph.py `
+  --processed-dir data\processed\qilin_full_feature_opt `
+  --embed-dim 64
+```
+
+升级到 Feature-Opt v2 列（历史语义、cold_stage、text_stat、image/video meta 等）：
+
+```powershell
+& $PY scripts\upgrade_feature_opt_v2_columns.py `
+  --processed-dir data\processed\qilin_full_feature_opt `
+  --output-dir data\processed\qilin_full_feature_opt_v2 `
+  --qilin-dir data\raw\Qilin `
+  --max-history 20
+```
+
+---
+
+### 步骤 2：一体化 embedding + compact（推荐）
+
+`scripts/build_processed_compact.py` 在**同一流程**中完成：
+
+1. 文本/查询 BGE 编码（默认跳过已存在的 sidecar）
+2. 按 `notes.image_path` 在 `--image-root` 下定位图片，SigLIP 编码视觉向量
+3. 更新 `metadata.json` 的 sidecar 配置
+4. 输出 compact parquet（剥离内嵌高维列，保留 mmap sidecar）
+
+```powershell
+& $PY scripts\build_processed_compact.py `
+  --processed-dir data\processed\qilin_full_feature_opt_v2 `
+  --output-dir data\processed\qilin_full_feature_opt_v2_compact `
+  --qilin-dir data\raw\Qilin `
+  --image-root "E:\qilin\mnt\ali-sh-1\usr\lihaitao\process_0106\image" `
+  --text-model-name D:\models\bge-small-zh-v1.5 `
+  --text-pooling cls `
+  --visual-model-name D:\models\siglip-base-patch16-224 `
+  --visual-output-dim 128 `
+  --visual-compression pca `
+  --visual-batch-size 64 `
+  --visual-fp16 `
+  --visual-image-workers 4 `
+  --visual-cache-dir data\processed\visual_path_cache_siglip `
+  --text-device cuda `
+  --visual-device cuda
+```
+
+常用变体：
+
+
+| 场景                          | 命令追加                                    |
+| --------------------------- | --------------------------------------- |
+| 文本已编码，只补视觉 + compact        | `--skip-text`                           |
+| 视觉已编码，只补文本 + compact        | `--skip-visual`                         |
+| 仅 compact（sidecar 已在 v2 目录） | `--skip-text --skip-visual`             |
+| 强制全部重编码                     | `--force-reencode`                      |
+| 冒烟测试                        | `--mock-visual --visual-max-items 1000` |
+
+
+产物：
+
+- `compact_summary.json` — parquet 列精简统计
+- `pipeline_summary.json` — 本次 text/visual/compact 摘要
+- `visual_embedding_summary.json` — 图片路径命中与编码统计
+- `image_embeddings.npy` / `video_embeddings.npy` — 由**当前图片路径**编码得到
+
+path 级 cache 写在 `--visual-cache-dir`；重复执行时**自动跳过**已有文本 sidecar 与已缓存图片路径，不会无谓重跑 BGE。
+
+#### 分步执行（可选）
+
+若希望拆开跑，仍可单独调用：
+
+```powershell
+# 仅文本
+& $PY scripts\build_text_embeddings.py --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_feature_opt_v2 --model-name D:\models\bge-small-zh-v1.5 --item-texts joint title content --query --pooling cls --device cuda
+
+# 仅从图片路径编码视觉
+& $PY scripts\build_visual_embeddings.py --modality both --processed-dir data\processed\qilin_full_feature_opt_v2 --qilin-dir data\raw\Qilin --image-root "E:\qilin\mnt\ali-sh-1\usr\lihaitao\process_0106\image" --model-name D:\models\siglip-base-patch16-224 --output-dim 128 --compression pca --batch-size 64 --fp16 --cache-dir data\processed\visual_path_cache_siglip --device cuda
+
+# 仅 compact
+& $PY scripts\compact_processed_features.py --processed-dir data\processed\qilin_full_feature_opt_v2 --output-dir data\processed\qilin_full_feature_opt_v2_compact
+```
+
+`scripts/merge_embeddings.py` 仅用于把 embedding **写回 parquet 宽表**；compact 主线不需要。
+
+---
+
+### 步骤 3：训练
+
+```powershell
+& $PY scripts\train.py --config configs\qilin_feature_opt_v2_history_compact.yaml
 ```
 
 断点续训：
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_full.yaml --resume outputs\qilin_full_multimodal_meta\last.pt
+& $PY scripts\train.py `
+  --config configs\qilin_feature_opt_v2_history_compact.yaml `
+  --resume outputs\qilin_feature_opt_v2_history_compact\last.pt
 ```
 
-### 6. 验证和测试
+训练产出：
+
+
+| 文件                          | 说明                     |
+| --------------------------- | ---------------------- |
+| `best.pt`                   | 验证集 `quality_score` 最优 |
+| `last.pt`                   | 最后一轮（可与 best 二选一保留）    |
+| `metrics.csv`               | 每轮 train/valid 指标      |
+| `summary.json`              | 最优轮次与选模指标              |
+| `valid_predictions.parquet` | 验证集预测（展示台用）            |
+| `config.yaml`               | 训练配置快照                 |
+
+
+当前配置要点：`batch_size=3072`，`fast_loader=true`，`selection_metric=quality_score`，`enable_intent_heads=false`，`use_text_fusion_gate=true`，`use_query_interaction=true`，`use_history_semantic=true`。
+
+---
+
+### 步骤 4：验证 / 测试评估
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\evaluate.py --checkpoint outputs\qilin_full_multimodal_meta\best.pt --samples data\processed\qilin_full_multimodal_meta\valid.parquet --device cuda --batch-size 2048
+& $PY scripts\evaluate.py `
+  --checkpoint outputs\qilin_feature_opt_v2_history_compact\best.pt `
+  --samples data\processed\qilin_full_feature_opt_v2_compact\valid.parquet `
+  --batch-size 8192 `
+  --fast-loader `
+  --topk 20
 
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\evaluate.py --checkpoint outputs\qilin_full_multimodal_meta\best.pt --samples data\processed\qilin_full_multimodal_meta\test.parquet --device cuda --batch-size 2048
+& $PY scripts\evaluate.py `
+  --checkpoint outputs\qilin_feature_opt_v2_history_compact\best.pt `
+  --samples data\processed\qilin_full_feature_opt_v2_compact\test.parquet `
+  --batch-size 8192 `
+  --fast-loader `
+  --topk 20
 ```
 
-### 7. 导出 Top-20
+---
+
+### 步骤 5：导出测试集 Top-20
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\infer.py --checkpoint outputs\qilin_full_multimodal_meta\best.pt --samples data\processed\qilin_full_multimodal_meta\test.parquet --output outputs\qilin_full_multimodal_meta\submission_top20_dedup.csv --device cuda --batch-size 2048
+& $PY scripts\infer.py `
+  --checkpoint outputs\qilin_feature_opt_v2_history_compact\best.pt `
+  --samples data\processed\qilin_full_feature_opt_v2_compact\test.parquet `
+  --output outputs\qilin_feature_opt_v2_history_compact\submission_top20_dedup.csv `
+  --batch-size 8192 `
+  --topk 20
 ```
 
 输出字段：
@@ -250,48 +314,156 @@ D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\infer.py --checkpoint output
 request_id, rank, item_id, score, p_click, p_collect, p_share
 ```
 
+---
+
+### 步骤 6：模态 Gate 诊断
+
+```powershell
+& $PY scripts\report_gate_metrics.py `
+  --checkpoint outputs\qilin_feature_opt_v2_history_compact\best.pt `
+  --samples data\processed\qilin_full_feature_opt_v2_compact\test.parquet `
+  --output outputs\qilin_feature_opt_v2_history_compact\test_gate_metrics.json
+```
+
+输出包含 `grouped_top20`（graph / dense / text 等分组）与 `raw_top20`（`ItemEncoder.part_names` 全部分量）。
+
+---
+
+### 步骤 7：生成并启动展示台
+
+```powershell
+& $PY scripts\export_showcase_data.py `
+  --processed-dir data\processed\qilin_full_feature_opt_v2_compact `
+  --run-dir outputs\qilin_feature_opt_v2_history_compact `
+  --checkpoint outputs\qilin_feature_opt_v2_history_compact\best.pt `
+  --config configs\qilin_feature_opt_v2_history_compact.yaml `
+  --output-dir outputs\showcase_feature_opt_v2_compact `
+  --thumbnail-index-dir data\processed\qilin_full_feature_opt_v2_compact `
+  --max-cases 120
+```
+
+自检：
+
+```powershell
+& $PY demo\showcase_app.py --data-dir outputs\showcase_feature_opt_v2_compact --smoke
+```
+
+启动网页：
+
+```powershell
+& $PY demo\showcase_app.py `
+  --data-dir outputs\showcase_feature_opt_v2_compact `
+  --host 127.0.0.1 `
+  --port 7860
+```
+
+浏览器打开 `http://127.0.0.1:7860`。
+
+---
+
+## 模型设计摘要
+
+### 多模态 Item 表征
+
+`ItemEncoder` 将 item ID、类目、位置、text（title/content 经 `TextFusionGate` 融合）、image-meta、video-meta、image/video emb、item_dense、ratio、cold_stage、graph 等投影到统一空间，再经 **softmax gate fusion** 得到 item 向量。缺失模态在 gate 中 mask，不参与归一化。
+
+### 用户侧与排序
+
+- `UserInterestEncoder`：Transformer 编码历史序列，可融合 history semantic 摘要。
+- `QueryInteractionModule`：query 与候选 item 交互。
+- `PLERanker`：8 shared experts × 4 task experts × 3 层，输出三任务 logit。
+- `rank_score_head`：与任务概率按 `rank_score_blend=0.2` 融合为 `final_score`。
+- 辅助头：like / comment / page_time（`enable_aux_heads=true`）。
+
+### 训练目标
+
+```text
+L = 加权 Focal BCE(click/collect/share)
+  + bpr_weight * request BPR
+  + task_bpr_weight * per-task BPR
+  + listwise_weight * listwise
+  + aux_* 辅助回归/分类
+  + l2_weight * L2
+```
+
+当前配置中 `transition` / `contrastive` / `collect&share listwise` 权重均为 0；`enable_intent_heads=false`，不训练意图转移头。
+
+### 选模与指标
+
+- 验证集按 `**quality_score**` 保存 `best.pt`（非单独 WH@20）。
+- `quality_score` 由 `ranking_quality_score`（60%）与 `recommendation_quality_score`（40%）组成。
+
+---
+
 ## 常用脚本
 
-| 脚本 | 作用 |
-| --- | --- |
-| `scripts/prepare_qilin.py` | 转换 Qilin parquet，生成训练/验证/测试表和 metadata |
-| `scripts/build_text_embeddings.py` | 生成离线文本 embedding |
-| `scripts/merge_embeddings.py` | 合并文本或视觉 embedding 到样本表 |
-| `scripts/build_item_graph.py` | 构建 item graph embedding |
-| `scripts/build_visual_embeddings.py` | 预留真实图片 embedding 入口 |
-| `scripts/train.py` | 训练或断点续训 |
-| `scripts/evaluate.py` | 验证/测试评估 |
-| `scripts/infer.py` | 导出 Top-20 推荐结果 |
+
+| 脚本                                          | 作用                                      |
+| ------------------------------------------- | --------------------------------------- |
+| `scripts/prepare_qilin.py`                  | 原始 Qilin → processed parquet + metadata |
+| `scripts/upgrade_feature_opt_v2_columns.py` | 在已有 processed 上追加 v2 特征列                |
+| `scripts/build_processed_compact.py`        | **推荐** 文本 + 图片路径视觉 + compact 一步完成       |
+| `scripts/build_text_embeddings.py`          | 单独离线文本/查询 embedding                     |
+| `scripts/build_item_graph.py`               | 构建 `graph_embedding.npy`                |
+| `scripts/compact_processed_features.py`     | 单独剥离 parquet 内嵌高维列                      |
+| `scripts/build_visual_embeddings.py`        | 单独从本地图片路径编码 SigLIP/CLIP                 |
+| `scripts/attach_visual_sidecars.py`         | （已弃用）从其他 processed 目录复制视觉 sidecar       |
+| `scripts/merge_embeddings.py`               | 将 sidecar 合并回 parquet（非 compact 主线）     |
+| `scripts/train.py`                          | 训练 / 断点续训                               |
+| `scripts/evaluate.py`                       | 单 split 排序指标评估                          |
+| `scripts/infer.py`                          | 导出 Top-20 CSV                           |
+| `scripts/report_gate_metrics.py`            | Top-20 模态 gate 分组统计                     |
+| `scripts/export_showcase_data.py`           | 生成展示台离线数据                               |
+| `scripts/check_parameter_budget.py`         | 估算参数量与 checkpoint 体积                    |
+| `scripts/audit_reliability.py`              | 数据可靠性审计                                 |
+
+
+---
 
 ## 指标说明
 
-- `WeightedHit@20`：主指标近似值，等于 `0.3*HitClick@20 + 0.4*HitCollect@20 + 0.3*HitShare@20`。
-- `NDCG@20`：考虑排序位置的加权相关性指标。
-- `HitClick/Collect/Share@20`：Top-20 中是否命中对应行为正样本，并对请求取平均。
-- `RecallClick/Collect/Share@20`：只在有对应正样本的请求上计算召回。
-- `AUC Click/Collect/Share`：三类二分类任务的区分能力。
-- `mean_gate_*`：所有候选样本上的平均模态 gate 权重。
-- `top20_mean_gate_*`：Top-20 候选上的平均模态 gate 权重。
 
-## Visual Thumbnail Pipeline
+| 指标                               | 含义                                                    |
+| -------------------------------- | ----------------------------------------------------- |
+| `WeightedHit@20`                 | `0.3·HitClick + 0.4·HitCollect + 0.3·HitShare`（请求级平均） |
+| `NDCG@20`                        | 按任务权重加权的排序 NDCG                                       |
+| `quality_score`                  | 综合排序与推荐质量（**当前选模指标**）                                 |
+| `preference_auc`                 | 请求内加权相关性 pair AUC                                     |
+| `request_auc_`* / `request_ap_`* | 分任务请求级 AUC / AP                                       |
+| `mean_gate_*`                    | 全候选平均模态 gate                                          |
+| `top20_mean_gate_*`              | 各请求 Top-20 内平均 gate，再对请求均值                            |
 
-The visual version keeps CLIP/SigLIP outside the deployed recommender. Image/video thumbnail embeddings are generated offline, compressed to 128 dimensions, then appended after the existing image/video metadata features.
 
-```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\build_visual_embeddings.py --modality both --qilin-dir data\raw\Qilin --processed-dir data\processed\qilin_full_multimodal_meta --image-root data\raw\Qilin\images --video-root data\raw\Qilin\video_thumbnails --model-name openai/clip-vit-base-patch32 --output-dim 128 --compression auto --batch-size 64 --device cuda
+更完整的指标定义见 `docs/ranking_metrics.md`。
 
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\merge_embeddings.py --processed-dir data\processed\qilin_full_multimodal_meta --output-dir data\processed\qilin_full_multimodal_visual --image --video --merge-mode auto
+---
 
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\check_parameter_budget.py --config configs\qilin_score_opt_mild_visual.yaml --budget-mb 800 --fail-over-budget
+## 常见问题
 
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\train.py --config configs\qilin_score_opt_mild_visual.yaml
-```
+**Q: compact 与全量 `qilin_full_feature_opt_v2` 有何区别？**  
+A: 特征语义相同；compact 把 text/query 512 维列移出 parquet，训练时经 mmap sidecar 加载，磁盘与 IO 更省。全量目录可在确认 compact 无误后删除以释放约 17GB。
 
-For a fast no-download smoke test, add `--mock-encoder --max-items 1000` to `build_visual_embeddings.py`. The mock vectors are deterministic and only validate the data path; they are not meant for final metrics.
+**Q: 视觉 embedding 从哪来？**  
+A: 由 `build_processed_compact.py`（或 `build_visual_embeddings.py`）根据 `notes.image_path` 在 `--image-root` 下解析真实文件并 SigLIP 编码。不要从其他实验目录复制 sidecar。
+
+**Q: 挂载视觉 sidecar 后需要重跑文本 embedding 吗？**  
+A: 一体化脚本默认 `--skip-existing`：已有 `text_*.npy` / `query_*.npy` 会跳过。用 `--force-reencode` 可强制全量重跑。
+
+**Q: 为什么 image_emb gate 接近 0？**  
+A: 仅 9.7% item 有向量，且 gate 还有 image_meta 等竞争分量；扩大 `build_visual_embeddings` 覆盖后需重新训练。
+
+**Q: `part_30`–`part_50` 磁盘有图为何没用上？**  
+A: 路径解析依赖 `notes.image_path`，当前 metadata 只引用 `part_0`–`part_29`。要覆盖更多分片需扩展路径规则或补全 notes 映射。
+
+**Q: 训练很慢 / GPU 利用率低？**  
+A: 确认 `fast_loader: true`、`batch_size` 足够大（如 3072）、`num_workers` 在 Windows 上常为 0；评估用 `--fast-loader --batch-size 8192`。
+
+---
 
 ## 后续优化方向
 
-1. 接入真实图片文件后，用 `scripts/build_visual_embeddings.py` 生成 CLIP/SigLIP 图像 embedding，再与当前 image metadata 拼接或替换。
-2. 将文本 embedding 模型从 Qwen2-0.5B 替换为更适合检索的 BGE/E5 类模型，比较 NDCG 和 AUC。
-3. 对 collect/share 做更细的采样和重加权实验，重点观察 HitCollect@20、HitShare@20 与 WeightedHit@20 的权衡。
-4. 对 item graph 做去噪或按行为类型加权，避免 graph gate 过强时压制 image/video/text 的增量贡献。
+1. 扩大 SigLIP 视觉覆盖（`part_30+` 路径映射 + 增量 `build_visual_embeddings`），再训一版 compact 模型。
+2. 在视觉覆盖率提升后，观察 `image_emb` gate 与 NDCG 是否同步上升。
+3. 对 collect/share 稀疏任务继续做 listwise / 重加权实验（当前 collect&share listwise 权重为 0）。
+4. 若 graph gate 长期偏高，可对 graph embedding 去噪或降低 graph 在 gate 中的竞争强度。
+
