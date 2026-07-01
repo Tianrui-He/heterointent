@@ -347,7 +347,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderOverview() {
       const m = state.overview.metrics.valid_best || {};
       const d = state.overview.dataset.train || {};
-      document.getElementById("runInfo").textContent = `${state.overview.run_dir} | blend=${fmt(state.overview.rank_score_blend, 2)}`;
+      document.getElementById("runInfo").textContent = `${state.overview.run_dir}`;
       const cards = [
         ["valid WeightedHit@20", m["weighted_hit@20"]],
         ["valid NDCG@20", m["ndcg@20"]],
@@ -429,7 +429,6 @@ INDEX_HTML = r"""<!doctype html>
     function renderWhy(item) {
       document.getElementById("scoreBars").innerHTML = [
         barLine("weighted_prob", item.weighted_prob_score, "var(--blue)"),
-        barLine("rank_score_head", item.rank_score, "var(--green)"),
         barLine("final_score", item.final_score ?? item.score, "var(--purple)"),
         barLine("p_click", item.p_click, "var(--blue)"),
         barLine("p_collect", item.p_collect, "var(--red)"),
@@ -588,7 +587,7 @@ def smoke_test(data_dir: Path) -> None:
         conn.request("GET", "/api/overview")
         overview = conn.getresponse()
         payload = overview.read()
-        assert overview.status == 200 and b"rank_score_blend" in payload
+        assert overview.status == 200 and b"score_weights" in payload
         conn.request("GET", "/api/cases")
         cases = conn.getresponse()
         assert cases.status == 200 and len(json.loads(cases.read().decode("utf-8"))) > 0

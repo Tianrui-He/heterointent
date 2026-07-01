@@ -30,7 +30,6 @@ SCALAR_FEATURE_COLUMNS = (
     "item_click_bucket",
     "has_query",
     "has_image_emb",
-    "has_video_emb",
 )
 
 SIDECAR_FEATURE_SPECS = {
@@ -38,10 +37,7 @@ SIDECAR_FEATURE_SPECS = {
     "text_title": ("text_title", "item_id"),
     "text_content": ("text_content", "item_id"),
     "query": ("query", "request_id"),
-    "image": ("image", "item_id"),
-    "video": ("video", "item_id"),
     "image_emb": ("image", "item_id"),
-    "video_emb": ("video", "item_id"),
 }
 
 
@@ -435,8 +431,9 @@ class FastTensorBatchLoader:
         return {key: value.pin_memory() for key, value in batch.items()}
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
+        device = self.tensors[next(iter(self.tensors))].device
         if self.shuffle:
-            indices = torch.randperm(self.num_samples)
+            indices = torch.randperm(self.num_samples, device=device)
             for start in range(0, self.num_samples, self.batch_size):
                 idx = indices[start:start + self.batch_size]
                 yield self._maybe_pin({key: value.index_select(0, idx) for key, value in self.tensors.items()})
@@ -488,12 +485,16 @@ class RequestPreservingBatchLoader:
 
     def _batch_from_groups(self, groups: list[torch.Tensor]) -> dict[str, torch.Tensor]:
         idx = groups[0] if len(groups) == 1 else torch.cat(groups)
+        device = self.tensors[next(iter(self.tensors))].device
+        if idx.device != device:
+            idx = idx.to(device)
         return self._maybe_pin({key: value.index_select(0, idx) for key, value in self.tensors.items()})
 
     def __iter__(self) -> Iterator[dict[str, torch.Tensor]]:
         if not self.groups:
             return
-        group_order = torch.randperm(len(self.groups)).tolist() if self.shuffle else list(range(len(self.groups)))
+        device = self.tensors[next(iter(self.tensors))].device
+        group_order = torch.randperm(len(self.groups), device=device).tolist() if self.shuffle else list(range(len(self.groups)))
         pending: list[torch.Tensor] = []
         pending_size = 0
         for group_idx in group_order:

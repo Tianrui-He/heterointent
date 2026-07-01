@@ -5,8 +5,10 @@ import hashlib
 import json
 import math
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from queue import Empty, Queue
 from typing import Iterable
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,7 +23,7 @@ from tqdm import tqdm
 
 
 IMAGE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
-PATH_PREFIXES = {"image", "images", "video", "videos", "thumbnail", "thumbnails"}
+PATH_PREFIXES = {"image", "images", "thumbnail", "thumbnails"}
 CACHE_INDEX_NAME = "path_embedding_index.parquet"
 CACHE_VALUES_NAME = "path_embeddings.npy"
 CACHE_META_NAME = "path_embedding_cache.json"
@@ -80,6 +82,27 @@ def _available_child_dirs(root: Path | None) -> set[str]:
     return {path.name.lower() for path in root.iterdir() if path.is_dir()}
 
 
+def _part_number_from_path(path: Path | str) -> int | None:
+    for part in Path(str(path).replace("\\", "/")).parts:
+        lower = part.lower()
+        if lower.startswith("part_") and lower[5:].isdigit():
+            return int(lower[5:])
+    return None
+
+
+def _part_allowed(path: Path | str, part_min: int | None = None, part_max: int | None = None) -> bool:
+    if part_min is None and part_max is None:
+        return True
+    part = _part_number_from_path(path)
+    if part is None:
+        return False
+    if part_min is not None and part < int(part_min):
+        return False
+    if part_max is not None and part > int(part_max):
+        return False
+    return True
+
+
 def _candidate_paths(
     root: Path | None,
     raw_item_id: int,
@@ -118,6 +141,8 @@ def _resolve_existing_paths(
     max_paths: int,
     available_dirs: set[str] | None = None,
     fallback_raw_id_paths: bool = True,
+    part_min: int | None = None,
+    part_max: int | None = None,
 ) -> list[Path]:
     seen: set[str] = set()
     found: list[Path] = []
@@ -132,6 +157,8 @@ def _resolve_existing_paths(
         if key in seen:
             continue
         seen.add(key)
+        if not _part_allowed(candidate, part_min=part_min, part_max=part_max):
+            continue
         if trusted_parent or candidate.is_file():
             found.append(candidate)
             if len(found) >= max_paths:
@@ -143,11 +170,11 @@ def load_visual_index(
     processed_dir: Path,
     qilin_dir: Path | None,
     image_root: Path | None,
-    video_root: Path | None,
-    modality: str,
     max_images_per_item: int,
     max_items: int = 0,
     fallback_raw_id_paths: bool = True,
+    image_part_min: int | None = None,
+    image_part_max: int | None = None,
 ) -> pd.DataFrame:
     item_map = pd.read_parquet(processed_dir / "item_id_map.parquet").sort_values("item_id")
     if int(max_items) > 0:
@@ -160,7 +187,6 @@ def load_visual_index(
         notes["image_path"] = None
         notes["note_type"] = 0
     image_dirs = _available_child_dirs(image_root)
-    video_dirs = _available_child_dirs(video_root)
 
     rows: list[dict[str, object]] = []
     for row in notes.itertuples(index=False):
@@ -169,38 +195,17 @@ def load_visual_index(
         note_type = int(float(getattr(row, "note_type", 0) or 0))
         raw_paths = getattr(row, "image_path", None)
 
-        if modality == "image":
-            paths = _resolve_existing_paths(
-                image_root,
-                raw_item_id,
-                raw_paths,
-                max_images_per_item,
-                available_dirs=image_dirs,
-                fallback_raw_id_paths=fallback_raw_id_paths,
-            )
-            source = "image_path" if paths else "missing"
-        else:
-            paths = _resolve_existing_paths(
-                video_root,
-                raw_item_id,
-                raw_paths,
-                max_images_per_item,
-                available_dirs=video_dirs,
-                fallback_raw_id_paths=fallback_raw_id_paths,
-            )
-            source = "video_root"
-            if not paths and note_type == 2:
-                paths = _resolve_existing_paths(
-                    image_root,
-                    raw_item_id,
-                    raw_paths,
-                    max_images_per_item,
-                    available_dirs=image_dirs,
-                    fallback_raw_id_paths=fallback_raw_id_paths,
-                )
-                source = "image_cover" if paths else "missing"
-            elif not paths:
-                source = "missing"
+        paths = _resolve_existing_paths(
+            image_root,
+            raw_item_id,
+            raw_paths,
+            max_images_per_item,
+            available_dirs=image_dirs,
+            fallback_raw_id_paths=fallback_raw_id_paths,
+            part_min=image_part_min,
+            part_max=image_part_max,
+        )
+        source = "image_path" if paths else "missing"
 
         path_strings = [str(path) for path in paths]
         rows.append(
@@ -208,7 +213,7 @@ def load_visual_index(
                 "item_id": item_id,
                 "raw_item_id": raw_item_id,
                 "note_type": note_type,
-                "modality": modality,
+                "modality": "image",
                 "path": path_strings[0] if path_strings else "",
                 "paths_json": json.dumps(path_strings, ensure_ascii=False),
                 "path_count": len(path_strings),
@@ -332,10 +337,21 @@ def _collate_image_batch(batch: list[tuple[int, np.ndarray, bool]]) -> tuple[lis
 
 
 def _load_image_array(task: tuple[int, str, int]) -> tuple[int, np.ndarray | None]:
-    from PIL import Image, ImageOps
-
     idx, path, image_size = task
     try:
+        try:
+            import cv2
+
+            arr = cv2.imread(path, cv2.IMREAD_COLOR)
+            if arr is not None:
+                arr = cv2.cvtColor(arr, cv2.COLOR_BGR2RGB)
+                if image_size > 0:
+                    arr = cv2.resize(arr, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+                return idx, arr
+        except ImportError:
+            pass
+        from PIL import Image, ImageOps
+
         with Image.open(path) as image:
             if image_size > 0:
                 try:
@@ -344,7 +360,7 @@ def _load_image_array(task: tuple[int, str, int]) -> tuple[int, np.ndarray | Non
                     pass
                 image = ImageOps.exif_transpose(image).convert("RGB").resize(
                     (image_size, image_size),
-                    Image.Resampling.BICUBIC,
+                    Image.Resampling.BILINEAR,
                 )
             else:
                 image = ImageOps.exif_transpose(image).convert("RGB")
@@ -370,8 +386,32 @@ def _paths_from_items(items: pd.DataFrame) -> tuple[list[Path], dict[str, list[i
                 continue
             seen_for_item.add(key)
             path_to_items.setdefault(path, []).append(item_idx)
-    paths = [Path(path) for path in path_to_items]
+
+    def sort_key(path: str) -> tuple[int, str]:
+        part = _part_number_from_path(path)
+        return (part if part is not None else 10**9, path.lower())
+
+    paths = [Path(path) for path in sorted(path_to_items, key=sort_key)]
     return paths, path_to_items
+
+
+def _part_counts_from_items(items: pd.DataFrame, encoded_only: bool = False) -> dict[str, int]:
+    counts: dict[int, int] = {}
+    for row in items.itertuples(index=False):
+        if encoded_only and int(getattr(row, "encoded_path_count", 0) or 0) <= 0:
+            continue
+        for raw_path in json.loads(getattr(row, "paths_json") or "[]"):
+            part = _part_number_from_path(raw_path)
+            if part is not None:
+                counts[part] = counts.get(part, 0) + 1
+    return {str(part): int(counts[part]) for part in sorted(counts)}
+
+
+def _part_range(part_counts: dict[str, int]) -> tuple[int | None, int | None]:
+    if not part_counts:
+        return None, None
+    parts = [int(part) for part in part_counts]
+    return min(parts), max(parts)
 
 
 def _load_path_cache(cache_dir: Path | None, model_name: str) -> tuple[pd.DataFrame, np.ndarray]:
@@ -435,17 +475,49 @@ def _embedding_from_output(output: object) -> torch.Tensor:
     return output.last_hidden_state[:, 0]
 
 
+def _processor_value(processor: object, name: str, default: object) -> object:
+    value = getattr(processor, name, None)
+    if value is None and hasattr(processor, "image_processor"):
+        value = getattr(getattr(processor, "image_processor"), name, None)
+    return default if value is None else value
+
+
+def _fast_preprocess_image_arrays(images: list[np.ndarray], processor: object) -> dict[str, torch.Tensor]:
+    """Vectorized preprocessing for RGB arrays already resized by _load_image_array."""
+
+    arr = np.stack(images, axis=0).astype("float32", copy=False)
+    if bool(_processor_value(processor, "do_rescale", True)):
+        arr *= float(_processor_value(processor, "rescale_factor", 1.0 / 255.0))
+    mean = np.asarray(_processor_value(processor, "image_mean", [0.5, 0.5, 0.5]), dtype="float32")
+    std = np.asarray(_processor_value(processor, "image_std", [0.5, 0.5, 0.5]), dtype="float32")
+    arr = (arr - mean.reshape(1, 1, 1, 3)) / std.reshape(1, 1, 1, 3)
+    arr = np.ascontiguousarray(arr.transpose(0, 3, 1, 2))
+    return {"pixel_values": torch.from_numpy(arr)}
+
+
 def _forward_images_adaptive(
     images: list[np.ndarray],
     processor: object,
     model: torch.nn.Module,
     device: torch.device,
     fp16: bool,
+    *,
+    preprocessed: dict[str, torch.Tensor] | None = None,
 ) -> np.ndarray:
     try:
-        inputs = processor(images=images, return_tensors="pt").to(device)
+        if preprocessed is None:
+            inputs = processor(images=images, return_tensors="pt", do_resize=False, do_center_crop=False)
+        else:
+            inputs = preprocessed
+        if device.type == "cuda":
+            inputs = {key: value.pin_memory().to(device, non_blocking=True) for key, value in inputs.items()}
+        else:
+            if isinstance(inputs, dict):
+                inputs = {key: value.to(device) for key, value in inputs.items()}
+            else:
+                inputs = inputs.to(device)
         use_fp16 = bool(fp16 and device.type == "cuda")
-        with torch.no_grad(), torch.autocast("cuda", dtype=torch.float16, enabled=use_fp16):
+        with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16, enabled=use_fp16):
             if hasattr(model, "get_image_features"):
                 output = model.get_image_features(**inputs)
             else:
@@ -465,6 +537,22 @@ def _forward_images_adaptive(
         return np.concatenate([left, right], axis=0)
 
 
+def _load_image_batch(
+    batch_paths: list[Path],
+    start_offset: int,
+    image_size: int,
+    executor: ThreadPoolExecutor | None,
+) -> tuple[list[int], list[np.ndarray]]:
+    tasks = [(start_offset + offset, str(path), int(image_size)) for offset, path in enumerate(batch_paths)]
+    if executor is not None:
+        loaded = list(executor.map(_load_image_array, tasks))
+    else:
+        loaded = [_load_image_array(task) for task in tasks]
+    batch_indices = [idx for idx, image in loaded if image is not None]
+    images = [image for _, image in loaded if image is not None]
+    return batch_indices, images
+
+
 def _encode_paths_with_transformers(
     paths: list[Path],
     model_name: str,
@@ -473,6 +561,12 @@ def _encode_paths_with_transformers(
     fp16: bool,
     image_workers: int,
     image_size: int,
+    prefetch_batches: int = 2,
+    fast_preprocess: bool = True,
+    *,
+    processor: object | None = None,
+    model: torch.nn.Module | None = None,
+    device: torch.device | None = None,
 ) -> tuple[list[int], np.ndarray]:
     try:
         from transformers import AutoImageProcessor, AutoModel
@@ -482,31 +576,132 @@ def _encode_paths_with_transformers(
     if not paths:
         return [], np.zeros((0, 0), dtype="float32")
 
-    device = _model_device(device_name)
-    processor = AutoImageProcessor.from_pretrained(model_name)
-    model = AutoModel.from_pretrained(model_name).to(device)
-    model.eval()
+    owns_model = processor is None or model is None
+    if device is None:
+        device = _model_device(device_name)
+    if owns_model:
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+        processor = AutoImageProcessor.from_pretrained(model_name)
+        model = AutoModel.from_pretrained(model_name).to(device)
+        model.eval()
+
+    batch_size_int = max(int(batch_size), 1)
+    workers = max(int(image_workers), 0)
+    batch_starts = list(range(0, len(paths), batch_size_int))
+    print(
+        "visual encoder "
+        f"paths={len(paths)} batches={len(batch_starts)} batch_size={batch_size_int} "
+        f"workers={workers} prefetch={int(prefetch_batches)} fp16={bool(fp16)} "
+        f"fast_preprocess={bool(fast_preprocess)} device={device}"
+    )
+    if int(prefetch_batches) <= 0:
+        executor = ThreadPoolExecutor(max_workers=workers) if workers > 0 else None
+        good_path_indices: list[int] = []
+        chunks: list[np.ndarray] = []
+        try:
+            for start in tqdm(batch_starts, desc="visual path embeddings"):
+                batch_paths = paths[start : start + batch_size_int]
+                batch_indices, images = _load_image_batch(batch_paths, start, image_size, executor)
+                if not images:
+                    continue
+                preprocessed = _fast_preprocess_image_arrays(images, processor) if fast_preprocess else None
+                emb = _forward_images_adaptive(
+                    images=images,
+                    processor=processor,
+                    model=model,
+                    device=device,
+                    fp16=fp16,
+                    preprocessed=preprocessed,
+                )
+                good_path_indices.extend(batch_indices)
+                chunks.append(emb)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+        if not chunks:
+            return [], np.zeros((0, 0), dtype="float32")
+        return good_path_indices, np.concatenate(chunks, axis=0)
+
+    prefetch_depth = max(int(prefetch_batches), 1)
+    load_queue: Queue[tuple[list[int], list[np.ndarray]] | None] = Queue(maxsize=prefetch_depth)
+    tensor_queue: Queue[tuple[list[int], dict[str, torch.Tensor] | None] | None] = Queue(maxsize=1)
+    worker_errors: list[BaseException] = []
+
+    def prefetch_worker() -> None:
+        executor = ThreadPoolExecutor(max_workers=workers) if workers > 0 else None
+        try:
+            for start in batch_starts:
+                batch_paths = paths[start : start + batch_size_int]
+                load_queue.put(_load_image_batch(batch_paths, start, image_size, executor))
+        except BaseException as exc:
+            worker_errors.append(exc)
+        finally:
+            if executor is not None:
+                executor.shutdown(wait=True)
+            load_queue.put(None)
+
+    def processor_worker() -> None:
+        try:
+            while True:
+                item = load_queue.get()
+                if item is None:
+                    tensor_queue.put(None)
+                    break
+                batch_indices, images = item
+                if not images:
+                    tensor_queue.put((batch_indices, None))
+                    continue
+                if fast_preprocess:
+                    inputs = _fast_preprocess_image_arrays(images, processor)
+                else:
+                    inputs = processor(images=images, return_tensors="pt", do_resize=False, do_center_crop=False)
+                tensor_queue.put((batch_indices, inputs))
+        except BaseException as exc:
+            worker_errors.append(exc)
+            tensor_queue.put(None)
+
+    loader = threading.Thread(target=prefetch_worker, daemon=True)
+    prep = threading.Thread(target=processor_worker, daemon=True)
+    loader.start()
+    prep.start()
 
     good_path_indices: list[int] = []
     chunks: list[np.ndarray] = []
-    workers = max(int(image_workers), 0)
-    executor = ThreadPoolExecutor(max_workers=workers) if workers > 0 else None
-    try:
-        iterator = range(0, len(paths), int(batch_size))
-        for start in tqdm(iterator, total=math.ceil(len(paths) / max(int(batch_size), 1)), desc="visual path embeddings"):
-            batch_paths = paths[start : start + int(batch_size)]
-            tasks = [(start + offset, str(path), int(image_size)) for offset, path in enumerate(batch_paths)]
-            loaded = list(executor.map(_load_image_array, tasks)) if executor is not None else [_load_image_array(task) for task in tasks]
-            batch_indices = [idx for idx, image in loaded if image is not None]
-            images = [image for _, image in loaded if image is not None]
-            if not images:
-                continue
-            emb = _forward_images_adaptive(images, processor, model, device, fp16=fp16)
-            good_path_indices.extend(batch_indices)
-            chunks.append(emb)
-    finally:
-        if executor is not None:
-            executor.shutdown(wait=True)
+    for _ in tqdm(batch_starts, desc="visual path embeddings"):
+        idle_checks = 0
+        while True:
+            if worker_errors:
+                raise RuntimeError("Visual prefetch worker failed") from worker_errors[0]
+            try:
+                item = tensor_queue.get(timeout=30)
+                break
+            except Empty:
+                idle_checks += 1
+                if worker_errors:
+                    raise RuntimeError("Visual prefetch worker failed") from worker_errors[0]
+                if not loader.is_alive() and not prep.is_alive():
+                    raise RuntimeError("Visual prefetch workers stopped without producing a batch")
+                if idle_checks >= 20:
+                    raise TimeoutError("No visual batch produced for 10 minutes; restart with fewer image workers")
+        if item is None:
+            break
+        batch_indices, inputs = item
+        if inputs is None:
+            continue
+        emb = _forward_images_adaptive(
+            images=[],
+            processor=processor,
+            model=model,
+            device=device,
+            fp16=fp16,
+            preprocessed=inputs,
+        )
+        good_path_indices.extend(batch_indices)
+        chunks.append(emb)
+    loader.join(timeout=1.0)
+    prep.join(timeout=1.0)
+
     if not chunks:
         return [], np.zeros((0, 0), dtype="float32")
     return good_path_indices, np.concatenate(chunks, axis=0)
@@ -522,6 +717,8 @@ def _encode_with_transformers(
     image_workers: int = 0,
     cache_save_dtype: str = "float16",
     image_size: int = 224,
+    prefetch_batches: int = 2,
+    fast_preprocess: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     unique_paths, path_to_items = _paths_from_items(items)
     if not unique_paths:
@@ -548,30 +745,60 @@ def _encode_with_transformers(
     ]
     missing = current.loc[missing_mask].reset_index(drop=True)
     newly_encoded_paths = 0
+    print(
+        "visual cache "
+        f"unique_paths={len(unique_paths)} cached={len(unique_paths) - len(missing)} "
+        f"missing={len(missing)} cache_dir={cache_dir or ''}"
+    )
     if not missing.empty:
         missing_paths = [Path(path) for path in missing["path"].tolist()]
-        good_missing_indices, new_values = _encode_paths_with_transformers(
-            missing_paths,
-            model_name=model_name,
-            batch_size=batch_size,
-            device_name=device_name,
-            fp16=fp16,
-            image_workers=image_workers,
-            image_size=image_size,
-        )
-        if good_missing_indices:
-            good_missing = missing.iloc[good_missing_indices].copy().reset_index(drop=True)
-            if cache_values.size and int(cache_values.shape[1]) != int(new_values.shape[1]):
-                raise ValueError(
-                    f"Visual cache embedding dim mismatch: {cache_values.shape[1]} != {new_values.shape[1]}"
+        processor = None
+        model = None
+        device = _model_device(device_name)
+        try:
+            from transformers import AutoImageProcessor, AutoModel
+
+            if device.type == "cuda":
+                torch.backends.cudnn.benchmark = True
+            processor = AutoImageProcessor.from_pretrained(model_name)
+            model = AutoModel.from_pretrained(model_name).to(device)
+            model.eval()
+            save_every = max(int(batch_size) * 128, 65536)
+            for chunk_start in range(0, len(missing_paths), save_every):
+                chunk_paths = missing_paths[chunk_start : chunk_start + save_every]
+                chunk_frame = missing.iloc[chunk_start : chunk_start + len(chunk_paths)].reset_index(drop=True)
+                good_rel_indices, new_values = _encode_paths_with_transformers(
+                    chunk_paths,
+                    model_name=model_name,
+                    batch_size=batch_size,
+                    device_name=device_name,
+                    fp16=fp16,
+                    image_workers=image_workers,
+                    image_size=image_size,
+                    prefetch_batches=prefetch_batches,
+                    fast_preprocess=fast_preprocess,
+                    processor=processor,
+                    model=model,
+                    device=device,
                 )
-            start_row = int(cache_values.shape[0]) if cache_values.size else 0
-            good_missing["row"] = np.arange(start_row, start_row + len(good_missing), dtype=np.int64)
-            cache_index = pd.concat([cache_index, good_missing[["path", "size", "mtime_ns", "row"]]], ignore_index=True)
-            cache_values = new_values if not cache_values.size else np.concatenate([cache_values, new_values], axis=0)
-            newly_encoded_paths = len(good_missing)
-            if cache_dir is not None:
-                _save_path_cache(cache_dir, cache_index, cache_values, model_name, cache_save_dtype)
+                if not good_rel_indices:
+                    continue
+                good_missing = chunk_frame.iloc[good_rel_indices].copy().reset_index(drop=True)
+                if cache_values.size and int(cache_values.shape[1]) != int(new_values.shape[1]):
+                    raise ValueError(
+                        f"Visual cache embedding dim mismatch: {cache_values.shape[1]} != {new_values.shape[1]}"
+                    )
+                start_row = int(cache_values.shape[0]) if cache_values.size else 0
+                good_missing["row"] = np.arange(start_row, start_row + len(good_missing), dtype=np.int64)
+                cache_index = pd.concat([cache_index, good_missing[["path", "size", "mtime_ns", "row"]]], ignore_index=True)
+                cache_values = new_values if not cache_values.size else np.concatenate([cache_values, new_values], axis=0)
+                newly_encoded_paths += len(good_missing)
+                if cache_dir is not None:
+                    _save_path_cache(cache_dir, cache_index, cache_values, model_name, cache_save_dtype)
+        finally:
+            del processor, model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
     path_row_lookup = {
         str(row.path): int(row.row)
@@ -639,20 +866,21 @@ def compress_embeddings(values: np.ndarray, output_dim: int, method: str, random
 
 
 def build_embeddings_for_modality(args: argparse.Namespace, modality: str) -> dict[str, object]:
+    if modality != "image":
+        raise ValueError("Only image visual embeddings are enabled in the current mainline")
     processed_dir = Path(args.processed_dir)
     image_root = Path(args.image_root) if args.image_root else None
-    video_root = Path(args.video_root) if args.video_root else None
     qilin_dir = Path(args.qilin_dir) if args.qilin_dir else None
 
     items = load_visual_index(
         processed_dir=processed_dir,
         qilin_dir=qilin_dir,
         image_root=image_root,
-        video_root=video_root,
-        modality=modality,
         max_images_per_item=int(args.max_images_per_item),
         max_items=int(args.max_items),
         fallback_raw_id_paths=bool(getattr(args, "fallback_raw_id_paths", False) or not getattr(args, "qilin_dir", None)),
+        image_part_min=getattr(args, "image_part_min", None),
+        image_part_max=getattr(args, "image_part_max", None),
     )
 
     encoder_name = str(getattr(args, "encoder", "transformers"))
@@ -672,6 +900,8 @@ def build_embeddings_for_modality(args: argparse.Namespace, modality: str) -> di
             image_workers=int(getattr(args, "image_workers", 0)),
             cache_save_dtype=str(getattr(args, "cache_save_dtype", "float16")),
             image_size=int(getattr(args, "image_size", 224)),
+            prefetch_batches=int(getattr(args, "prefetch_batches", 2)),
+            fast_preprocess=bool(getattr(args, "fast_preprocess", True)),
         )
 
     if raw_values.shape[1] == 0:
@@ -695,6 +925,10 @@ def build_embeddings_for_modality(args: argparse.Namespace, modality: str) -> di
     items.loc[items["encoded_path_count"].gt(0), "status"] = "encoded"
     items["embedding_dim"] = int(raw_values.shape[1])
     items["compression"] = compression
+    found_part_counts = _part_counts_from_items(items, encoded_only=False)
+    encoded_part_counts = _part_counts_from_items(items, encoded_only=True)
+    found_part_min, found_part_max = _part_range(found_part_counts)
+    encoded_part_min, encoded_part_max = _part_range(encoded_part_counts)
 
     dtype = np.float16 if str(args.save_dtype) == "float16" else np.float32
     np.save(processed_dir / f"{modality}_embeddings.npy", raw_values.astype(dtype, copy=False))
@@ -712,6 +946,14 @@ def build_embeddings_for_modality(args: argparse.Namespace, modality: str) -> di
         "compression": compression,
         "save_dtype": str(args.save_dtype),
         "model_name": encoder_name if encoder_name != "transformers" else str(args.model_name),
+        "image_part_min": getattr(args, "image_part_min", None),
+        "image_part_max": getattr(args, "image_part_max", None),
+        "found_part_min": found_part_min,
+        "found_part_max": found_part_max,
+        "encoded_part_min": encoded_part_min,
+        "encoded_part_max": encoded_part_max,
+        "found_part_counts": found_part_counts,
+        "encoded_part_counts": encoded_part_counts,
     }
     (processed_dir / f"{modality}_embedding_summary.json").write_text(
         json.dumps(summary, ensure_ascii=False, indent=2),
@@ -744,15 +986,6 @@ def apply_visual_sidecar_metadata(processed_dir: Path, summaries: list[dict[str,
                 "ids": "image_embedding_item_ids.npy",
                 "dim": dim,
             }
-        elif modality == "video":
-            metadata["video_emb_dim"] = dim
-            sidecars["video_emb"] = {
-                "source": "video",
-                "id_col": "item_id",
-                "values": "video_embeddings.npy",
-                "ids": "video_embedding_item_ids.npy",
-                "dim": dim,
-            }
     metadata["feature_sidecars"] = sidecars
     metadata.pop("visual_sidecar_source", None)
     metadata["visual_embedding_source"] = "build_visual_embeddings"
@@ -770,9 +1003,8 @@ def build_visual_embeddings_for_processed(
     processed_dir: Path,
     *,
     image_root: Path | None = None,
-    video_root: Path | None = None,
     qilin_dir: Path | None = None,
-    modalities: tuple[str, ...] = ("image", "video"),
+    modalities: tuple[str, ...] = ("image",),
     model_name: str = "openai/clip-vit-base-patch32",
     output_dim: int = 128,
     compression: str = "auto",
@@ -783,8 +1015,12 @@ def build_visual_embeddings_for_processed(
     image_workers: int = 0,
     cache_save_dtype: str = "float16",
     image_size: int = 224,
+    prefetch_batches: int = 2,
+    fast_preprocess: bool = True,
     max_images_per_item: int = 4,
     max_items: int = 0,
+    image_part_min: int | None = None,
+    image_part_max: int | None = None,
     save_dtype: str = "float32",
     seed: int = 2026,
     encoder: str = "transformers",
@@ -796,18 +1032,31 @@ def build_visual_embeddings_for_processed(
     update_metadata: bool = True,
 ) -> list[dict[str, object]]:
     processed_dir = Path(processed_dir)
+    unsupported = set(modalities) - {"image"}
+    if unsupported:
+        raise ValueError(f"Only image visual embeddings are enabled in the current mainline, got: {sorted(unsupported)}")
     summaries: list[dict[str, object]] = []
     for modality in modalities:
         if skip_existing and visual_sidecar_ready(processed_dir, modality):
             summary_path = processed_dir / f"{modality}_embedding_summary.json"
             if summary_path.exists():
-                summaries.append(json.loads(summary_path.read_text(encoding="utf-8")))
-                print(f"skip existing {modality} embeddings in {processed_dir}")
-                continue
+                summary = json.loads(summary_path.read_text(encoding="utf-8"))
+                part_range_requested = image_part_min is not None or image_part_max is not None
+                part_range_matches = (
+                    not part_range_requested
+                    or (
+                        summary.get("image_part_min") == image_part_min
+                        and summary.get("image_part_max") == image_part_max
+                    )
+                )
+                if part_range_matches:
+                    summaries.append(summary)
+                    print(f"skip existing {modality} embeddings in {processed_dir}")
+                    continue
+                print(f"rebuild {modality} embeddings because requested image part range changed")
         args = argparse.Namespace(
             processed_dir=str(processed_dir),
             image_root=str(image_root) if image_root else None,
-            video_root=str(video_root) if video_root else None,
             qilin_dir=str(qilin_dir) if qilin_dir else None,
             model_name=model_name,
             output_dim=output_dim,
@@ -819,8 +1068,12 @@ def build_visual_embeddings_for_processed(
             image_workers=image_workers,
             cache_save_dtype=cache_save_dtype,
             image_size=image_size,
+            prefetch_batches=prefetch_batches,
+            fast_preprocess=fast_preprocess,
             max_images_per_item=max_images_per_item,
             max_items=max_items,
+            image_part_min=image_part_min,
+            image_part_max=image_part_max,
             save_dtype=save_dtype,
             seed=seed,
             encoder=encoder,
@@ -842,11 +1095,10 @@ def build_visual_embeddings_for_processed(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build parameter-friendly image/video thumbnail embeddings for processed Qilin items."
+        description="Build parameter-friendly image thumbnail embeddings for processed Qilin items."
     )
-    parser.add_argument("--modality", choices=["image", "video", "both"], default="image")
+    parser.add_argument("--modality", choices=["image"], default="image")
     parser.add_argument("--image-root", default=None, help="Directory containing Qilin images or image covers.")
-    parser.add_argument("--video-root", default=None, help="Directory containing local video thumbnails/covers.")
     parser.add_argument("--qilin-dir", default=None, help="Optional raw Qilin directory. notes/image_path is used when present.")
     parser.add_argument("--processed-dir", default=str(ROOT / "data" / "processed" / "qilin_full"))
     parser.add_argument("--model-name", default="openai/clip-vit-base-patch32")
@@ -858,7 +1110,7 @@ def main() -> None:
     )
     parser.add_argument("--output-dim", type=int, default=128, help="Compressed embedding dimension; <=0 keeps raw dimension.")
     parser.add_argument("--compression", choices=["auto", "pca", "random", "none"], default="auto")
-    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", default="auto")
     parser.add_argument("--cache-dir", default=None, help="Persistent raw visual path embedding cache directory.")
     parser.add_argument(
@@ -868,7 +1120,10 @@ def main() -> None:
         help="Storage dtype for cached raw SigLIP/CLIP path embeddings.",
     )
     parser.add_argument("--fp16", action="store_true", help="Use CUDA autocast float16 for transformer image encoding.")
-    parser.add_argument("--image-workers", type=int, default=0, help="Parallel image loading workers for transformer encoding.")
+    parser.add_argument("--image-workers", type=int, default=8, help="Parallel image loading workers for transformer encoding.")
+    parser.add_argument("--prefetch-batches", type=int, default=3, help="Number of image batches to prefetch while GPU encodes.")
+    parser.add_argument("--fast-preprocess", action="store_true", default=True, help="Use vectorized preprocessing for already resized RGB arrays.")
+    parser.add_argument("--no-fast-preprocess", action="store_false", dest="fast_preprocess")
     parser.add_argument(
         "--image-size",
         type=int,
@@ -882,6 +1137,8 @@ def main() -> None:
     )
     parser.add_argument("--max-images-per-item", type=int, default=4)
     parser.add_argument("--max-items", type=int, default=0, help="Optional debug limit.")
+    parser.add_argument("--image-part-min", type=int, default=None, help="Only use image paths from part_N >= this value.")
+    parser.add_argument("--image-part-max", type=int, default=None, help="Only use image paths from part_N <= this value.")
     parser.add_argument("--save-dtype", choices=["float32", "float16"], default="float32")
     parser.add_argument("--seed", type=int, default=2026)
     parser.add_argument("--mock-encoder", action="store_true", help="Use deterministic hash vectors for tests/smoke runs.")
@@ -889,13 +1146,11 @@ def main() -> None:
     parser.add_argument("--handcrafted-dim", type=int, default=64)
     args = parser.parse_args()
 
-    modalities = ["image", "video"] if args.modality == "both" else [args.modality]
     build_visual_embeddings_for_processed(
         Path(args.processed_dir),
         image_root=Path(args.image_root) if args.image_root else None,
-        video_root=Path(args.video_root) if args.video_root else None,
         qilin_dir=Path(args.qilin_dir) if args.qilin_dir else None,
-        modalities=tuple(modalities),
+        modalities=("image",),
         model_name=str(args.model_name),
         output_dim=int(args.output_dim),
         compression=str(args.compression),
@@ -906,8 +1161,12 @@ def main() -> None:
         image_workers=int(args.image_workers),
         cache_save_dtype=str(args.cache_save_dtype),
         image_size=int(args.image_size),
+        prefetch_batches=int(args.prefetch_batches),
+        fast_preprocess=bool(args.fast_preprocess),
         max_images_per_item=int(args.max_images_per_item),
         max_items=int(args.max_items),
+        image_part_min=args.image_part_min,
+        image_part_max=args.image_part_max,
         save_dtype=str(args.save_dtype),
         seed=int(args.seed),
         encoder=str(args.encoder),

@@ -60,10 +60,9 @@ def test_item_encoder_masks_absent_modalities_in_gate() -> None:
         "num_items": 4,
         "num_item_types": 3,
         "num_taxonomies": 5,
-        "image_dim": 2,
-        "video_dim": 2,
+        "image_emb_dim": 2,
+        "video_meta_dim": 2,
         "text_dim": 0,
-        "dense_dim": 0,
     }
     encoder = ItemEncoder(metadata=metadata, embed_dim=8, max_position=20, dropout=0.0, use_graph_embedding=False)
     batch = {
@@ -71,13 +70,14 @@ def test_item_encoder_masks_absent_modalities_in_gate() -> None:
         "item_type": torch.tensor([1, 2]),
         "taxonomy_id": torch.tensor([1, 2]),
         "position": torch.tensor([1, 2]),
-        "image_feat": torch.tensor([[0.0, 0.0], [1.0, 0.0]]),
-        "video_feat": torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
+        "has_image_emb": torch.tensor([0, 1]),
+        "image_emb_feat": torch.tensor([[1.0, 0.0], [1.0, 0.0]]),
+        "video_meta_feat": torch.tensor([[1.0, 0.0], [0.0, 0.0]]),
     }
 
     _, extras = encoder(batch)
-    image_idx = encoder.part_names.index("image")
-    video_idx = encoder.part_names.index("video")
+    image_idx = encoder.part_names.index("image_emb")
+    video_idx = encoder.part_names.index("video_meta")
 
     assert extras["modality_gate_mask"][0, image_idx] == 0.0
     assert extras["modality_gate"][0, image_idx] < 1e-6
@@ -90,10 +90,7 @@ def test_item_encoder_forward_without_image_or_video_features() -> None:
         "num_items": 4,
         "num_item_types": 3,
         "num_taxonomies": 5,
-        "image_dim": 0,
-        "video_dim": 0,
         "text_dim": 0,
-        "dense_dim": 0,
     }
     encoder = ItemEncoder(metadata=metadata, embed_dim=8, max_position=20, dropout=0.0, use_graph_embedding=False)
     batch = {
@@ -107,42 +104,3 @@ def test_item_encoder_forward_without_image_or_video_features() -> None:
 
     assert fused.shape == (2, 8)
     assert extras["modality_gate"].shape == (2, 4)
-
-
-def test_item_encoder_disabled_modalities_remove_projection_parts() -> None:
-    metadata = {
-        "num_items": 4,
-        "num_item_types": 3,
-        "num_taxonomies": 5,
-        "image_dim": 2,
-        "video_dim": 2,
-        "text_dim": 3,
-        "dense_dim": 4,
-    }
-    encoder = ItemEncoder(
-        metadata=metadata,
-        embed_dim=8,
-        max_position=20,
-        dropout=0.0,
-        use_graph_embedding=False,
-        disabled_modalities=["text", "image"],
-    )
-    batch = {
-        "item_id": torch.tensor([1, 2]),
-        "item_type": torch.tensor([1, 2]),
-        "taxonomy_id": torch.tensor([1, 2]),
-        "position": torch.tensor([1, 2]),
-        "video_feat": torch.ones((2, 2)),
-        "dense_feat": torch.ones((2, 4)),
-    }
-
-    fused, extras = encoder(batch)
-
-    assert "text" not in encoder.projections
-    assert "image" not in encoder.projections
-    assert "video" in encoder.projections
-    assert "dense" in encoder.projections
-    assert "text" not in encoder.part_names
-    assert "image" not in encoder.part_names
-    assert fused.shape == (2, 8)
-    assert extras["modality_gate"].shape[1] == len(encoder.part_names)

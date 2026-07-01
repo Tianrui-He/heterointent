@@ -13,7 +13,7 @@ from heterointent.data.preprocess import preprocess_flat_samples
 def main() -> None:
     parser = argparse.ArgumentParser(description="Normalize flattened Qilin-like samples into train/valid/test parquet.")
     parser.add_argument("--input", required=True, help="CSV/JSON/JSONL/Parquet with one row per request-item candidate.")
-    parser.add_argument("--output-dir", default="data/processed/qilin")
+    parser.add_argument("--output-dir", default="data/run_latest/processed/qilin_flat")
     parser.add_argument("--max-history", type=int, default=20)
     args = parser.parse_args()
     metadata = preprocess_flat_samples(args.input, args.output_dir, max_history=args.max_history)

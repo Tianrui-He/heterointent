@@ -13,7 +13,7 @@ from heterointent.training import train
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train HeteroIntent-PLE.")
-    parser.add_argument("--config", default="configs/default.yaml")
+    parser.add_argument("--config", default="configs/qilin_feature_opt_v2_history_compact.yaml")
     parser.add_argument("--resume", default=None, help="Path to best.pt, last.pt, or epoch_XXX.pt for continued training.")
     args = parser.parse_args()
     result = train(load_config(args.config), resume_path=args.resume)

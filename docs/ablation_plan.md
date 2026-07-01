@@ -14,7 +14,7 @@
    - ID/category/dense only
    - + text features
    - + image/video metadata features
-   - + image/video features
+   - + SigLIP image embedding
    - + graph embedding
 
 4. Loss:
@@ -23,7 +23,6 @@
    - + request-level BPR
    - + per-task request-level BPR
    - + transition loss
-   - + contrastive loss
    - collect/share positive weight grid: 2/4/6/8
    - BPR weight grid: 0/0.01/0.03/0.05
 

@@ -13,7 +13,7 @@ from heterointent.utils import read_json
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build frozen LightGCN/FREEDOM-style item graph embeddings.")
-    parser.add_argument("--processed-dir", default="data/processed/qilin")
+    parser.add_argument("--processed-dir", default="data/run_latest/processed/qilin_base")
     parser.add_argument("--samples-file", default="train.parquet")
     parser.add_argument("--metadata-file", default="metadata.json")
     parser.add_argument("--output-file", default="graph_embedding.npy")

@@ -16,16 +16,13 @@ from heterointent.data.schema import FEATURE_PREFIXES
 
 
 SPLITS = ("train", "valid", "test")
-DEFAULT_GROUPS = ("text", "text_title", "text_content", "query", "image_emb", "video_emb")
+DEFAULT_GROUPS = ("text", "text_title", "text_content", "query", "image_emb")
 SIDECAR_SOURCES = {
     "text": ("text", "item_id"),
     "text_title": ("text_title", "item_id"),
     "text_content": ("text_content", "item_id"),
     "query": ("query", "request_id"),
-    "image": ("image", "item_id"),
-    "video": ("video", "item_id"),
     "image_emb": ("image", "item_id"),
-    "video_emb": ("video", "item_id"),
 }
 
 
@@ -170,8 +167,8 @@ def compact_processed_dir(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Drop repeated embedding columns from processed parquet splits and use sidecar npy lookup at training time.")
-    parser.add_argument("--processed-dir", default="data/processed/qilin_full_feature_opt_v2")
-    parser.add_argument("--output-dir", default="data/processed/qilin_full_feature_opt_v2_compact")
+    parser.add_argument("--processed-dir", default="data/run_latest/processed/qilin_v2")
+    parser.add_argument("--output-dir", default="data/run_latest/processed/qilin_full_feature_opt_v2_compact")
     parser.add_argument("--groups", nargs="+", default=list(DEFAULT_GROUPS), help="Feature groups to compact when a matching sidecar exists.")
     parser.add_argument("--batch-size", type=int, default=65536)
     parser.add_argument("--compression", default="zstd")

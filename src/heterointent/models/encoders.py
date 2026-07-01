@@ -13,13 +13,9 @@ ITEM_FEATURE_GROUPS = (
     "text_title",
     "text_content",
     "text_stat",
-    "image",
-    "video",
-    "dense",
     "image_meta",
     "video_meta",
     "image_emb",
-    "video_emb",
     "item_dense",
     "ratio",
 )
@@ -45,34 +41,14 @@ class ItemEncoder(nn.Module):
         max_position: int,
         dropout: float,
         use_graph_embedding: bool,
-        disabled_modalities: list[str] | None = None,
         encoder_cfg: dict | None = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.use_graph_embedding = use_graph_embedding
-        self.disabled_modalities = set(disabled_modalities or [])
         encoder_cfg = encoder_cfg or {}
         self.use_text_fusion_gate = bool(encoder_cfg.get("use_text_fusion_gate", False))
         self.use_cold_stage_gate = bool(encoder_cfg.get("use_cold_stage_gate", False))
-        supported = {
-            "text",
-            "text_title",
-            "text_content",
-            "text_stat",
-            "image",
-            "video",
-            "dense",
-            "image_meta",
-            "video_meta",
-            "image_emb",
-            "video_emb",
-            "item_dense",
-            "ratio",
-        }
-        unsupported = self.disabled_modalities - supported
-        if unsupported:
-            raise ValueError(f"Unsupported disabled modalities: {sorted(unsupported)}")
         self.item_embedding = nn.Embedding(int(metadata["num_items"]), embed_dim, padding_idx=0)
         self.type_embedding = nn.Embedding(int(metadata["num_item_types"]), embed_dim, padding_idx=0)
         self.taxonomy_embedding = nn.Embedding(int(metadata["num_taxonomies"]), embed_dim, padding_idx=0)
@@ -93,7 +69,7 @@ class ItemEncoder(nn.Module):
         self.projections = nn.ModuleDict()
         for name in ITEM_FEATURE_GROUPS:
             dim = int(metadata.get(f"{name}_dim", 0))
-            if dim > 0 and not self._is_disabled(name):
+            if dim > 0:
                 self.projections[name] = _projection(dim, embed_dim, dropout)
 
         self.text_fusion_gate = (
@@ -130,19 +106,6 @@ class ItemEncoder(nn.Module):
             self.part_names.append("graph")
         self.gate = nn.Linear(embed_dim * len(self.part_names), len(self.part_names))
         self.output = nn.Sequential(nn.LayerNorm(embed_dim), nn.Dropout(dropout))
-
-    def _is_disabled(self, name: str) -> bool:
-        if name in self.disabled_modalities:
-            return True
-        if name in {"text_title", "text_content"} and "text" in self.disabled_modalities:
-            return True
-        if name in {"image_meta", "image_emb"} and "image" in self.disabled_modalities:
-            return True
-        if name in {"video_meta", "video_emb"} and "video" in self.disabled_modalities:
-            return True
-        if name in {"item_dense", "ratio"} and "dense" in self.disabled_modalities:
-            return True
-        return False
 
     def set_graph_trainable(self, trainable: bool) -> None:
         self.graph_embedding.weight.requires_grad_(trainable)
@@ -183,8 +146,6 @@ class ItemEncoder(nn.Module):
             presence = feat.abs().sum(dim=-1).gt(0)
             if name == "image_emb" and "has_image_emb" in batch:
                 presence = presence & batch["has_image_emb"].gt(0)
-            if name == "video_emb" and "has_video_emb" in batch:
-                presence = presence & batch["has_video_emb"].gt(0)
             presence_by_name[name] = presence
             repr_ = projection(feat)
             parts_by_name[name] = repr_
@@ -253,7 +214,6 @@ class ItemEncoder(nn.Module):
             "text_title_repr": title_repr,
             "text_content_repr": content_repr,
             "text_joint_repr": joint_repr,
-            "image_repr": mean_projected(("image", "image_meta", "image_emb")),
             "item_text_repr": item_text_repr,
         }
         if text_gate is not None:

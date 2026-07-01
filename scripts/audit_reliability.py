@@ -90,7 +90,7 @@ def grouped_prediction_metrics(pred: pd.DataFrame, samples: pd.DataFrame, topk: 
         group_pred = _request_subset(pred, ids)
         metrics = _metrics_or_empty(group_pred, topk=topk)
         if metrics and name == "all" and oracle > 0:
-            metrics["weighted_hit_oracle_normalized"] = metrics.get("weighted_hit@20", float("nan")) / oracle
+            metrics["weighted_hit_oracle_normalized"] = metrics.get("official_weighted_hit@20", metrics.get("weighted_hit@20", float("nan"))) / oracle
         out[name] = metrics
     return out
 
@@ -159,7 +159,7 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
         for split, groups in report["prediction_metrics"].items():
             all_metrics = groups.get("all", {})
             lines.append(
-                f"- {split}: WeightedHit@20={all_metrics.get('weighted_hit@20', float('nan')):.6f}, "
+                f"- {split}: OfficialWeightedHit@20={all_metrics.get('official_weighted_hit@20', all_metrics.get('weighted_hit@20', float('nan'))):.6f}, "
                 f"NDCG@20={all_metrics.get('ndcg@20', float('nan')):.6f}, "
                 f"HardWeightedHit@20={all_metrics.get('hard_weighted_hit@20', float('nan')):.6f}, "
                 f"PreferenceAUC={all_metrics.get('preference_auc', float('nan')):.6f}, "
@@ -178,9 +178,9 @@ def write_markdown(report: dict[str, Any], path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Audit split candidate distributions and graph leakage risk.")
-    parser.add_argument("--processed-dir", default="data/processed/qilin_full_multimodal_meta")
+    parser.add_argument("--processed-dir", default="data/run_latest/processed/qilin_full_feature_opt_v2_compact")
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--output-dir", default="outputs/audits")
+    parser.add_argument("--output-dir", default="outputs/run_latest/audits")
     parser.add_argument("--batch-size", type=int, default=2048)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--topk", type=int, default=20)

@@ -69,7 +69,7 @@ def inspect_budget(config_path: Path, budget_mb: float) -> dict[str, object]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Check HeteroIntent model parameter size against a deployment budget.")
-    parser.add_argument("--config", default="configs/qilin_score_opt_mild_visual.yaml")
+    parser.add_argument("--config", default="configs/qilin_feature_opt_v2_history_compact.yaml")
     parser.add_argument("--budget-mb", type=float, default=800.0)
     parser.add_argument("--output", default=None, help="Optional JSON path for the budget report.")
     parser.add_argument("--fail-over-budget", action="store_true")

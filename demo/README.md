@@ -5,7 +5,7 @@
 ## 1. 生成展示数据
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\export_showcase_data.py --processed-dir data\processed\qilin_full_multimodal_meta --run-dir outputs\qilin_score_opt_mild --output-dir outputs\showcase
+D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\export_showcase_data.py --processed-dir data\run_latest\processed\qilin_full_feature_opt_v2_compact --run-dir outputs\run_latest\qilin_feature_opt_v2_history_compact --output-dir outputs\showcase_run_latest
 ```
 
 生成内容：
@@ -20,7 +20,7 @@ D:\adaconda3\envs\MiniOneRec-pre\python.exe scripts\export_showcase_data.py --pr
 ## 2. 自检
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe demo\showcase_app.py --data-dir outputs\showcase --smoke
+D:\adaconda3\envs\MiniOneRec-pre\python.exe demo\showcase_app.py --data-dir outputs\showcase_run_latest --smoke
 ```
 
 看到 `showcase app smoke ok` 表示首页和核心 API 可访问。
@@ -28,7 +28,7 @@ D:\adaconda3\envs\MiniOneRec-pre\python.exe demo\showcase_app.py --data-dir outp
 ## 3. 启动网页
 
 ```powershell
-D:\adaconda3\envs\MiniOneRec-pre\python.exe demo\showcase_app.py --data-dir outputs\showcase --host 127.0.0.1 --port 7860
+D:\adaconda3\envs\MiniOneRec-pre\python.exe demo\showcase_app.py --data-dir outputs\showcase_run_latest --host 127.0.0.1 --port 7860
 ```
 
 然后打开：
@@ -42,4 +42,4 @@ http://127.0.0.1:7860
 1. 先讲 Overview 的样本不均衡和核心指标。
 2. 切到 Showcase Cases，选择 `share` 或 `collect` 案例。
 3. 在 Request Explorer 中点击 Top-20 item。
-4. 用 Why This Rank 展示三任务概率、`rank_score_head`、模态 gate 和用户意图 attention。
+4. 用 Why This Rank 展示三任务概率、官方加权分、模态 gate 和用户意图 attention。

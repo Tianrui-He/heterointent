@@ -11,7 +11,6 @@ import yaml
 from scripts.build_visual_embeddings import build_embeddings_for_modality, load_visual_index
 from scripts.check_parameter_budget import inspect_budget
 from scripts.export_showcase_data import _attach_thumbnails, _load_thumbnail_lookup
-from scripts.merge_embeddings import merge_embeddings
 
 
 def _write_minimal_processed(path: Path) -> None:
@@ -28,9 +27,8 @@ def _write_minimal_processed(path: Path) -> None:
             "click": [1, 0],
             "collect": [0, 1],
             "share": [0, 0],
-            "image_feat_0": [0.1, 0.2],
-            "image_feat_1": [0.3, 0.4],
-            "video_feat_0": [0.5, 0.6],
+            "image_meta_feat_0": [0.1, 0.2],
+            "video_meta_feat_0": [0.5, 0.6],
         }
     )
     for split in ["train", "valid", "test"]:
@@ -44,16 +42,15 @@ def _write_minimal_processed(path: Path) -> None:
                 "num_taxonomies": 2,
                 "max_history": 20,
                 "text_dim": 0,
-                "image_dim": 2,
-                "video_dim": 1,
-                "dense_dim": 0,
+                "image_meta_dim": 1,
+                "video_meta_dim": 1,
             }
         ),
         encoding="utf-8",
     )
 
 
-def test_visual_index_resolves_images_and_video_cover_fallback(tmp_path: Path) -> None:
+def test_visual_index_resolves_images(tmp_path: Path) -> None:
     processed = tmp_path / "processed"
     _write_minimal_processed(processed)
     qilin_dir = tmp_path / "qilin"
@@ -71,12 +68,43 @@ def test_visual_index_resolves_images_and_video_cover_fallback(tmp_path: Path) -
     (image_root / "part" / "101.jpg").write_bytes(b"not a real image")
     (image_root / "part" / "202.jpg").write_bytes(b"not a real image")
 
-    image_index = load_visual_index(processed, qilin_dir, image_root, None, "image", max_images_per_item=4)
-    video_index = load_visual_index(processed, qilin_dir, image_root, None, "video", max_images_per_item=4)
+    image_index = load_visual_index(processed, qilin_dir, image_root, max_images_per_item=4)
 
     assert image_index["path_count"].tolist() == [1, 1]
-    assert video_index["path_count"].tolist() == [0, 1]
-    assert video_index.loc[1, "source"] == "image_cover"
+    assert image_index["source"].tolist() == ["image_path", "image_path"]
+
+
+def test_visual_index_can_filter_qilin_image_parts(tmp_path: Path) -> None:
+    processed = tmp_path / "processed"
+    _write_minimal_processed(processed)
+    qilin_dir = tmp_path / "qilin"
+    notes_dir = qilin_dir / "notes"
+    notes_dir.mkdir(parents=True)
+    pd.DataFrame(
+        {
+            "note_idx": [101, 202],
+            "image_path": [["image/part_50/101.jpg"], ["image/part_51/202.jpg"]],
+            "note_type": [1, 1],
+        }
+    ).to_parquet(notes_dir / "notes.parquet", index=False)
+    image_root = tmp_path / "images"
+    (image_root / "part_50").mkdir(parents=True)
+    (image_root / "part_51").mkdir(parents=True)
+    (image_root / "part_50" / "101.jpg").write_bytes(b"not a real image")
+    (image_root / "part_51" / "202.jpg").write_bytes(b"not a real image")
+
+    image_index = load_visual_index(
+        processed,
+        qilin_dir,
+        image_root,
+        max_images_per_item=4,
+        image_part_min=0,
+        image_part_max=50,
+    )
+
+    assert image_index["path_count"].tolist() == [1, 0]
+    assert "part_50" in image_index.loc[0, "path"]
+    assert image_index.loc[1, "status"] == "missing"
 
 
 def test_mock_visual_embedding_export_writes_all_items_and_summary(tmp_path: Path) -> None:
@@ -90,7 +118,6 @@ def test_mock_visual_embedding_export_writes_all_items_and_summary(tmp_path: Pat
         processed_dir=str(processed),
         qilin_dir=None,
         image_root=str(image_root),
-        video_root=None,
         max_images_per_item=4,
         max_items=0,
         mock_encoder=True,
@@ -113,92 +140,6 @@ def test_mock_visual_embedding_export_writes_all_items_and_summary(tmp_path: Pat
     assert item_ids.tolist() == [1, 2]
     assert np.linalg.norm(values[0]) > 0
     assert np.linalg.norm(values[1]) == 0
-
-
-def test_merge_embeddings_appends_visual_embeddings_after_meta_features(tmp_path: Path) -> None:
-    source = tmp_path / "source"
-    target = tmp_path / "target"
-    _write_minimal_processed(source)
-    np.save(source / "image_embeddings.npy", np.ones((2, 3), dtype="float32"))
-    np.save(source / "image_embedding_item_ids.npy", np.array([1, 2], dtype="int64"))
-    np.save(source / "video_embeddings.npy", np.full((2, 2), 2.0, dtype="float32"))
-    np.save(source / "video_embedding_item_ids.npy", np.array([1, 2], dtype="int64"))
-
-    summary = merge_embeddings(source, target, enabled={"text": False, "image": True, "video": True}, merge_mode="auto")
-    train = pd.read_parquet(target / "train.parquet")
-    metadata = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
-
-    assert summary["metadata"]["text_dim"] == 0
-    assert summary["metadata"]["image_dim"] == 5
-    assert summary["metadata"]["video_dim"] == 3
-    assert metadata["image_dim"] == 5
-    assert metadata["video_dim"] == 3
-    assert np.isclose(train.loc[0, "image_feat_0"], 0.1)
-    assert train.loc[0, "image_feat_2"] == 1.0
-    assert train.loc[0, "video_feat_1"] == 2.0
-
-
-def test_merge_embeddings_uses_split_visual_and_query_prefixes_for_new_schema(tmp_path: Path) -> None:
-    source = tmp_path / "source_new"
-    target = tmp_path / "target_new"
-    source.mkdir()
-    base = pd.DataFrame(
-        {
-            "request_id": [10, 11],
-            "item_id": [1, 2],
-            "user_id": [1, 1],
-            "item_type": [1, 2],
-            "taxonomy_id": [1, 1],
-            "position": [1, 2],
-            "click": [1, 0],
-            "collect": [0, 0],
-            "share": [0, 0],
-            "image_meta_feat_0": [0.1, 0.0],
-            "video_meta_feat_0": [0.0, 0.2],
-        }
-    )
-    for split in ["train", "valid", "test"]:
-        base.to_parquet(source / f"{split}.parquet", index=False)
-    (source / "metadata.json").write_text(
-        json.dumps(
-            {
-                "num_users": 2,
-                "num_items": 3,
-                "num_item_types": 3,
-                "num_taxonomies": 2,
-                "max_history": 20,
-                "image_meta_dim": 1,
-                "video_meta_dim": 1,
-            }
-        ),
-        encoding="utf-8",
-    )
-    np.save(source / "image_embeddings.npy", np.array([[1.0, 0.0], [0.0, 0.0]], dtype="float32"))
-    np.save(source / "image_embedding_item_ids.npy", np.array([1, 2], dtype="int64"))
-    np.save(source / "video_embeddings.npy", np.array([[0.0, 0.0], [0.5, 0.5]], dtype="float32"))
-    np.save(source / "video_embedding_item_ids.npy", np.array([1, 2], dtype="int64"))
-    np.save(source / "query_embeddings.npy", np.ones((2, 3), dtype="float32"))
-    np.save(source / "query_embedding_request_ids.npy", np.array([10, 11], dtype="int64"))
-
-    summary = merge_embeddings(
-        source,
-        target,
-        enabled={"text": False, "query": True, "image": True, "video": True},
-        merge_mode="auto",
-    )
-    train = pd.read_parquet(target / "train.parquet")
-    metadata = json.loads((target / "metadata.json").read_text(encoding="utf-8"))
-
-    assert summary["metadata"]["query_dim"] == 3
-    assert metadata["image_emb_dim"] == 2
-    assert metadata["video_emb_dim"] == 2
-    assert metadata["image_meta_dim"] == 2
-    assert metadata["video_meta_dim"] == 2
-    assert train["query_feat_0"].tolist() == [1.0, 1.0]
-    assert train["image_emb_feat_0"].tolist() == [1.0, 0.0]
-    assert train["video_emb_feat_0"].tolist() == [0.0, 0.5]
-    assert train["image_meta_feat_1"].tolist() == [1.0, 0.0]
-    assert train["video_meta_feat_1"].tolist() == [0.0, 1.0]
 
 
 def test_thumbnail_lookup_and_attach_uses_exported_embedding_items(tmp_path: Path) -> None:
@@ -240,10 +181,7 @@ def test_parameter_budget_report_for_visual_config_shape(tmp_path: Path) -> None
             "ranker": "ple",
             "use_graph_embedding": True,
             "graph_embedding_trainable": False,
-            "use_rank_head": True,
-            "rank_score_blend": 0.2,
             "enable_intent_heads": False,
-            "disabled_modalities": [],
         },
         "loss": {"task_weights": {"click": 0.3, "collect": 0.4, "share": 0.3}},
         "evaluation": {"score_weights": {"click": 0.3, "collect": 0.4, "share": 0.3}},
@@ -253,6 +191,6 @@ def test_parameter_budget_report_for_visual_config_shape(tmp_path: Path) -> None
     report = inspect_budget(config_path, budget_mb=800.0)
 
     assert report["under_budget"] is True
-    assert report["metadata_dims"]["image_dim"] == 2
-    assert report["metadata_dims"]["video_dim"] == 1
+    assert report["metadata_dims"]["image_meta_dim"] == 1
+    assert report["metadata_dims"]["video_meta_dim"] == 1
     assert report["total_params"] >= report["trainable_params"]

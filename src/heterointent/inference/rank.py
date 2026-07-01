@@ -47,8 +47,9 @@ def rank_predictions(pred: pd.DataFrame, topk: int = 20) -> pd.DataFrame:
         ranked_rows.append(ranked)
     if not ranked_rows:
         return pd.DataFrame(columns=["request_id", "rank", "item_id", "score", *[f"p_{t}" for t in TASKS]])
-    cols = ["request_id", "rank", "item_id", "score", *[f"p_{t}" for t in TASKS]]
-    return pd.concat(ranked_rows, ignore_index=True)[cols]
+    ranked = pd.concat(ranked_rows, ignore_index=True)
+    cols = ["request_id", "rank", "item_id", "score", *[col for col in [f"p_{t}" for t in TASKS] if col in ranked.columns]]
+    return ranked[cols]
 
 
 def rank_file(

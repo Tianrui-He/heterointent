@@ -47,7 +47,6 @@ def _minimal_batch(metadata: dict) -> dict[str, torch.Tensor]:
         "cold_stage_id": torch.tensor([2, 3], dtype=torch.long),
         "has_query": torch.tensor([1, 0], dtype=torch.long),
         "has_image_emb": torch.tensor([1, 0], dtype=torch.long),
-        "has_video_emb": torch.tensor([0, 1], dtype=torch.long),
         "history_items": torch.tensor([[1, 2, 0], [2, 0, 0]], dtype=torch.long),
         "history_item_types": torch.tensor([[1, 2, 0], [2, 0, 0]], dtype=torch.long),
         "history_taxonomy_ids": torch.tensor([[1, 2, 0], [2, 0, 0]], dtype=torch.long),
@@ -86,8 +85,6 @@ def test_feature_opt_v2_forward_backward_smoke() -> None:
             "use_cold_stage_gate": True,
             "use_history_semantic": True,
             "task_text_residual_weight": 0.1,
-            "use_rank_head": True,
-            "rank_score_blend": 0.2,
         },
         "loss": {
             "task_weights": {"click": 0.3, "collect": 0.4, "share": 0.3},

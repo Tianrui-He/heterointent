@@ -1,0 +1,2 @@
+1.item_embedding 学任务相关的 ID 表示；graph_embedding 提供「经常一起被曝光/点击」的协同信号，不必在端到端训练里再学一遍图结构，graph的embedding参数不更新，是否妥当
+2.

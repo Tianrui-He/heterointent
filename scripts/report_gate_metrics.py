@@ -20,7 +20,6 @@ README_GROUPS = {
     "video-meta": ("video_meta",),
     "image-meta": ("image_meta",),
     "image-emb": ("image_emb",),
-    "video-emb": ("video_emb",),
 }
 
 

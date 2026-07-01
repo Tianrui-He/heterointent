@@ -62,8 +62,8 @@ def create_strict_graph_processed(source_dir: Path, output_dir: Path) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a processed dir with graph rows zeroed for train-OOV items.")
-    parser.add_argument("--source-dir", default="data/processed/qilin_full_multimodal_meta")
-    parser.add_argument("--output-dir", default="data/processed/qilin_full_multimodal_meta_strict_graph_zero_oov")
+    parser.add_argument("--source-dir", default="data/run_latest/processed/qilin_full_feature_opt_v2_compact")
+    parser.add_argument("--output-dir", default="data/run_latest/processed/qilin_full_feature_opt_v2_compact_strict_graph_zero_oov")
     args = parser.parse_args()
     summary = create_strict_graph_processed(Path(args.source_dir), Path(args.output_dir))
     print(json.dumps(summary, ensure_ascii=False, indent=2))

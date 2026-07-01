@@ -17,12 +17,12 @@ def test_synthetic_training_smoke() -> None:
         num_requests=30,
         candidates_per_request=8,
         text_dim=8,
-        image_dim=8,
-        video_dim=4,
-        dense_dim=6,
+        image_emb_dim=8,
+        item_dense_dim=6,
+        ratio_dim=4,
         seed=7,
     )
-    cfg = load_config("configs/qilin_full.yaml")
+    cfg = load_config("configs/qilin_feature_opt_v2_history_compact.yaml")
     cfg["device"] = "cpu"
     cfg["data"]["processed_dir"] = str(processed)
     cfg["data"]["batch_size"] = 16
@@ -52,12 +52,12 @@ def test_score_optimized_training_smoke() -> None:
         num_requests=30,
         candidates_per_request=8,
         text_dim=8,
-        image_dim=8,
-        video_dim=4,
-        dense_dim=6,
+        image_emb_dim=8,
+        item_dense_dim=6,
+        ratio_dim=4,
         seed=11,
     )
-    cfg = load_config("configs/qilin_score_opt.yaml")
+    cfg = load_config("configs/qilin_feature_opt_v2_history_compact.yaml")
     cfg["device"] = "cpu"
     cfg["data"]["processed_dir"] = str(processed)
     cfg["data"]["batch_size"] = 24

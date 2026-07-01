@@ -1,7 +1,7 @@
 seed: 2026
 device: cuda
 data:
-  processed_dir: data/processed/qilin_full_feature_opt_v2_compact
+  processed_dir: data/processed/qilin_v2
   train_file: train.parquet
   valid_file: valid.parquet
   test_file: test.parquet
@@ -28,12 +28,9 @@ model:
   ple_layers: 3
   use_graph_embedding: true
   graph_embedding_trainable: false
-  disabled_modalities: []
-  enable_intent_heads: false
+  enable_intent_heads: true
   enable_aux_heads: true
   use_computed_cross: true
-  use_rank_head: true
-  rank_score_blend: 0.2
   use_text_fusion_gate: true
   use_query_interaction: true
   use_cold_stage_gate: true
@@ -52,19 +49,28 @@ loss:
     click: 1.0
     collect: 0.7
     share: 0.6
-  bpr_weight: 0.03
-  task_bpr_weight: 0.01
+  bpr_weight: 0.02
+  task_bpr_weight: 0.008
+  hard_bpr_weight: 0.01
+  hard_task_bpr_weight: 0.004
   bpr_max_groups: 128
   bpr_max_pairs_per_group: 64
-  listwise_weight: 0.02
-  collect_listwise_weight: 0.0
-  share_listwise_weight: 0.0
+  listwise_weight: 0.012
+  hard_listwise_weight: 0.01
+  rank_loss_min_group_size: 1
+  hard_rank_loss_min_group_size: 20
+  collect_listwise_weight: 0.012
+  share_listwise_weight: 0.008
+  hard_collect_listwise_weight: 0.006
+  hard_share_listwise_weight: 0.004
+  topk_coverage_weight: 0.02
+  topk_coverage_max_groups: 64
+  topk_coverage_temperature: 0.05
+  topk_coverage_margin: 0.0
   listwise_max_groups: 64
   listwise_temperature: 0.9
-  transition_weight: 0.0
-  type_transition_weight: 0.0
-  taxonomy_transition_weight: 0.0
-  contrastive_weight: 0.0
+  type_transition_weight: 0.008
+  taxonomy_transition_weight: 0.001
   aux_like_weight: 0.02
   aux_comment_weight: 0.01
   aux_page_time_weight: 0.01
@@ -81,11 +87,11 @@ train:
   min_epochs: 4
   amp: true
   compile: false
-  output_dir: outputs/qilin_feature_opt_v2_history_compact
+  output_dir: outputs\qilin_intend_transition
 evaluation:
   topk: 20
   enable_dynamic_intent_metrics: true
-  selection_metric: quality_score
+  selection_metric: native_selection_score
   score_weights:
     click: 0.3
     collect: 0.4

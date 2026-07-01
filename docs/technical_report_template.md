@@ -16,15 +16,15 @@ dynamic user intent and the Click/Collect/Share objective.
 
 HeteroIntent-PLE contains:
 
-- Item Encoder: item/domain/taxonomy/statistical/text/image/video/graph features.
+- Item Encoder: item/domain/taxonomy/statistical/text/image metadata/video metadata/image embedding/graph features.
 - User Encoder: SASRec-style session encoder + DIN-style candidate attention.
 - Cross-domain Alignment: gated multimodal fusion + denoised co-occurrence item graph.
 - Multi-task Ranker: PLE with click, collect and share towers.
 
-When raw image/video files are unavailable, image and video modalities are
-represented by structured metadata from Qilin parquet fields, such as image
-count, image path buckets, video duration and resolution. Missing modality
-masks prevent all-zero modality features from receiving fusion gate mass.
+Images are represented by SigLIP/PCA image embeddings plus image metadata.
+Videos are represented by structured metadata from Qilin parquet fields, such
+as video duration and resolution. Missing modality masks prevent all-zero image
+embeddings from receiving fusion gate mass.
 
 ## 4. Objective
 
@@ -35,7 +35,6 @@ L = 0.3 * BalancedFocalBCE_click
   + lambda_rank * BPR_weighted_score
   + lambda_task_rank * BPR_click_collect_share
   + lambda_intent * L_transition
-  + lambda_contrast * L_contrastive
 ```
 
 The balanced focal terms use stronger positive weights for sparse high-value

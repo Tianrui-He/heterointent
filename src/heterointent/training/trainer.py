@@ -131,12 +131,12 @@ def _load_history(output_dir: Path) -> list[dict]:
 def _metric_value(row: dict, metric_name: str) -> float:
     value = row.get(metric_name)
     if value is None or not pd.notna(value):
-        value = row.get("weighted_hit@20", -1.0)
+        value = row.get("official_weighted_hit@20", row.get("weighted_hit@20", -1.0))
     value = float(value)
     return value if np.isfinite(value) else -1.0
 
 
-def _best_metric_from_history(history: list[dict], metric_name: str = "quality_score") -> float:
+def _best_metric_from_history(history: list[dict], metric_name: str = "native_selection_score") -> float:
     values = [_metric_value(row, metric_name) for row in history]
     return max(values) if values else -1.0
 
@@ -202,7 +202,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
     history: list[dict] = []
     epochs = int(config["train"].get("epochs", 10))
     topk = int(config["evaluation"].get("topk", 20))
-    selection_metric = str(config.get("evaluation", {}).get("selection_metric", "quality_score"))
+    selection_metric = str(config.get("evaluation", {}).get("selection_metric", "native_selection_score"))
     start_epoch = 1
     best_metric = -1.0
     save_every_epoch = bool(config["train"].get("save_every_epoch", False))
@@ -239,7 +239,7 @@ def train(config: dict, resume_path: str | None = None) -> dict:
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=scaler.is_enabled()):
                 outputs = model(batch)
-                loss, logs = compute_loss(outputs, batch, config["loss"])
+                loss, logs = compute_loss(outputs, batch, config["loss"], topk=topk)
             scaler.scale(loss).backward()
             if float(config["train"].get("grad_clip", 0)) > 0:
                 scaler.unscale_(optimizer)
@@ -302,8 +302,13 @@ def train(config: dict, resume_path: str | None = None) -> dict:
         "best_metric": best_metric,
         "best_selection_metric": _metric_value(best_record, selection_metric) if best_record else best_metric,
         "best_epoch": int(best_record.get("epoch", 0)) if best_record else 0,
-        "best_weighted_hit@20": float(best_record.get("weighted_hit@20", float("nan"))) if best_record else float("nan"),
-        "best_quality_score": float(best_record.get("quality_score", float("nan"))) if best_record else float("nan"),
+        "best_native_selection_score": float(best_record.get("native_selection_score", float("nan"))) if best_record else float("nan"),
+        "best_official_weighted_hit@20": float(best_record.get("official_weighted_hit@20", float("nan"))) if best_record else float("nan"),
+        "best_hard_weighted_hit@20": float(best_record.get("hard_weighted_hit@20", float("nan"))) if best_record else float("nan"),
+        "best_hard_official_capture": float(best_record.get("hard_official_capture", float("nan"))) if best_record else float("nan"),
+        "best_sparse_ap": float(best_record.get("sparse_ap", float("nan"))) if best_record else float("nan"),
+        "best_sparse_recall": float(best_record.get("sparse_recall", float("nan"))) if best_record else float("nan"),
+        "best_rare_score": float(best_record.get("rare_score", float("nan"))) if best_record else float("nan"),
         "num_parameters": count_parameters(model),
         "device": str(device),
         "last_epoch": int(history[-1]["epoch"]) if history else 0,

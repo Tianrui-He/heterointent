@@ -245,19 +245,20 @@ def build_text_embeddings_for_processed(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build BGE/Transformer text embeddings for processed Qilin items.")
     parser.add_argument("--qilin-dir", default=str(ROOT / "data" / "raw" / "Qilin"))
-    parser.add_argument("--processed-dir", default=str(ROOT / "data" / "processed" / "qilin_full"))
-    parser.add_argument("--model-name", default="BAAI/bge-small-zh-v1.5")
+    parser.add_argument("--processed-dir", default=str(ROOT / "data" / "run_latest" / "processed" / "qilin_base"))
+    parser.add_argument("--model-name", default="D:\\models\\bge-small-zh-v1.5")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--max-length", type=int, default=256)
-    parser.add_argument("--pooling", choices=["mean", "cls"], default="mean", help="Use cls for BGE-style encoders; mean preserves the previous behavior.")
+    parser.add_argument("--pooling", choices=["mean", "cls"], default="cls", help="Use cls for BGE-style encoders; mean preserves the previous behavior.")
     parser.add_argument(
         "--item-texts",
         nargs="+",
         choices=["joint", "title", "content", "none"],
-        default=["joint"],
+        default=["joint", "title", "content"],
         help="Item text views to encode. joint preserves the previous text_embeddings.npy output.",
     )
-    parser.add_argument("--query", action="store_true", help="Encode request-level query/context text from processed train/valid/test files.")
+    parser.add_argument("--query", action="store_true", default=True, help="Encode request-level query/context text from processed train/valid/test files.")
+    parser.add_argument("--no-query", action="store_false", dest="query", help="Skip request-level query embeddings.")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args()
     build_text_embeddings_for_processed(
@@ -277,4 +278,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

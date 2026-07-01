@@ -1,34 +1,47 @@
-# 排序评估指标口径
+# Native 评估指标口径
 
-当前默认评估只保留能直接反映排序能力的核心指标。完整诊断指标仍可通过
-`compute_ranking_metrics(..., include_diagnostics=True)` 临时打开。
+当前数据集的核心问题是：多数请求候选数不超过 Top-20，click 覆盖占主导，collect/share 正样本极稀疏。因此主线不再使用旧 `quality_score` / `stable_selection_score` 选模，改用面向 hard request 和稀疏行为的 `native_selection_score`。
 
 ## 核心指标
 
-- `weighted_hit@20`：比赛近似主分，按 `0.3*click + 0.4*collect + 0.3*share` 汇总 Top-20 命中。它用于和比赛口径对齐，但在候选数小于等于 20 的请求上容易饱和。
-- `ndcg@20`：考虑排序位置的加权相关性。越喜欢的物品越靠前，分数越高。
-- `preference_auc`：请求内成对排序一致性。比较同一请求下任意两个候选，如果真实偏好更高的物品得分也更高，则记为排序正确。
-- `hard_weighted_hit@20`：只在候选数大于 TopK 的请求上计算 `weighted_hit@20`，用于过滤 Top-20 天然覆盖全部候选的简单请求。
-- `hard_ndcg@20`：只在候选数大于 TopK 的请求上计算 `ndcg@20`。
-- `hard_preference_auc`：只在候选数大于 TopK 的请求上计算 `preference_auc`。
-- `request_auc_click`：请求内点击正负样本的区分能力。
-- `request_auc_collect`：请求内收藏正负样本的区分能力。
-- `request_auc_share`：请求内分享正负样本的区分能力。
-- `request_ap_collect`：收藏目标的请求内平均精度，更适合观察稀疏正样本是否被排到前面。
-- `request_ap_share`：分享目标的请求内平均精度，更适合观察稀疏正样本是否被排到前面。
+- `native_selection_score`：主选模指标。
+- `official_weighted_hit@20`：官方公式近似口径，按 `0.3*click + 0.4*collect + 0.3*share` 汇总 Top-20 命中；仅用于对齐比赛，不单独决定模型好坏。
+- `hard_weighted_hit@20`：只在 `candidate_count > topk` 的请求上计算官方 hit。
+- `hard_official_capture`：`hard_weighted_hit@20 / oracle_score_eligible`，表示 hard 请求上捕获了多少理论可得分。
+- `hard_ndcg@20`：hard 请求上的位置敏感排序质量。
+- `hard_preference_auc`：hard 请求上的请求内加权偏好 AUC。
+- `sparse_ap`：hard 请求上 collect/share AP 的加权平均。
+- `sparse_recall`：hard 请求上 collect/share recall@20 的加权平均。
+- `topk_boundary_success_*`：对应任务正样本是否越过 Top-K 边界。
+- `topk_boundary_margin_*`：对应任务最高正样本分数减去第 K 名分数。
 
-## 覆盖率指标
+## 主选模公式
 
-- `candidate_count`：每个请求的平均候选数。
-- `candidate_count_gt_topk_rate`：候选数大于 TopK 的请求比例。这个比例越低，Top-20 命中越容易饱和。
-- `hard_topk_request_rate`：实际进入 hard 指标统计的请求比例，通常等于 `candidate_count_gt_topk_rate`。
-- `request_auc_request_rate_click`：点击 AUC 有效请求比例。没有正负样本同时存在的请求会被跳过。
-- `request_auc_request_rate_collect`：收藏 AUC 有效请求比例。
-- `request_auc_request_rate_share`：分享 AUC 有效请求比例。
-- `num_requests` / `num_rows`：参与评估的请求数和候选行数。
+```text
+native_selection_score =
+  0.30 * hard_official_capture
++ 0.25 * hard_ndcg@20
++ 0.20 * hard_preference_auc
++ 0.15 * sparse_ap
++ 0.10 * sparse_recall
+```
 
-## 使用建议
+接受新模型时还要看：
 
-模型选择仍保留 `weighted_hit@20`，因为它最接近比赛提交分；但判断真实排序能力时，应优先看
-`ndcg@20`、`preference_auc`、`hard_ndcg@20`、`hard_preference_auc`，以及
-`request_auc_collect/share` 和 `request_ap_collect/share`。
+```text
+hard_weighted_hit@20 不明显下降
+sparse_ap / sparse_recall 不明显下降
+paired bootstrap 的 P(delta > 0) >= 0.8
+```
+
+## 稳定性评估
+
+使用 `scripts/compare_predictions_bootstrap.py` 对两个预测文件做 request-level paired bootstrap。它输出：
+
+- `mean_delta`
+- `95% CI`
+- `P(delta > 0)`
+- candidate 分桶 delta
+- hard / rare hard 分桶 delta
+
+这个脚本用于判断窄分数区间内的提升是否可信，而不是只看单次 valid/test 均值。

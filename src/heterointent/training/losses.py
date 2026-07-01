@@ -60,6 +60,7 @@ def _group_bpr_loss(
     request_ids: torch.Tensor,
     max_groups: int = DEFAULT_BPR_MAX_GROUPS,
     max_pairs_per_group: int = DEFAULT_BPR_MAX_PAIRS_PER_GROUP,
+    min_group_size: int = 1,
 ) -> torch.Tensor:
     """Bounded request-level BPR.
 
@@ -86,8 +87,9 @@ def _group_bpr_loss(
 
     losses = []
     used_groups = 0
+    min_group_size = max(int(min_group_size), 1)
     for start, count in zip(starts_list, counts_list):
-        if count <= 1:
+        if count <= min_group_size:
             continue
         end = start + count
         group_scores = sorted_scores[start:end]
@@ -119,11 +121,19 @@ def request_bpr_loss(
     task_weights: torch.Tensor | None = None,
     max_groups: int = DEFAULT_BPR_MAX_GROUPS,
     max_pairs_per_group: int = DEFAULT_BPR_MAX_PAIRS_PER_GROUP,
+    min_group_size: int = 1,
 ) -> torch.Tensor:
     if task_weights is None:
         task_weights = torch.tensor(DEFAULT_TASK_WEIGHTS, dtype=labels.dtype, device=labels.device)
     rel = labels @ task_weights
-    return _group_bpr_loss(scores, rel, request_ids, max_groups=max_groups, max_pairs_per_group=max_pairs_per_group)
+    return _group_bpr_loss(
+        scores,
+        rel,
+        request_ids,
+        max_groups=max_groups,
+        max_pairs_per_group=max_pairs_per_group,
+        min_group_size=min_group_size,
+    )
 
 
 def request_task_bpr_loss(
@@ -133,6 +143,7 @@ def request_task_bpr_loss(
     task_weights: torch.Tensor,
     max_groups: int = DEFAULT_BPR_MAX_GROUPS,
     max_pairs_per_group: int = DEFAULT_BPR_MAX_PAIRS_PER_GROUP,
+    min_group_size: int = 1,
 ) -> torch.Tensor:
     losses = []
     for task_idx in range(labels.size(-1)):
@@ -143,6 +154,7 @@ def request_task_bpr_loss(
                 request_ids,
                 max_groups=max_groups,
                 max_pairs_per_group=max_pairs_per_group,
+                min_group_size=min_group_size,
             )
         )
     if not losses:
@@ -156,6 +168,7 @@ def _group_listwise_loss(
     request_ids: torch.Tensor,
     max_groups: int = DEFAULT_LISTWISE_MAX_GROUPS,
     temperature: float = 1.0,
+    min_group_size: int = 1,
 ) -> torch.Tensor:
     if scores.numel() == 0:
         return scores.new_tensor(0.0)
@@ -175,8 +188,9 @@ def _group_listwise_loss(
 
     losses = []
     used_groups = 0
+    min_group_size = max(int(min_group_size), 1)
     for start, count in zip(starts_list, counts_list):
-        if count <= 1:
+        if count <= min_group_size:
             continue
         end = start + count
         group_scores = sorted_scores[start:end] / temperature
@@ -201,11 +215,19 @@ def request_listwise_loss(
     task_weights: torch.Tensor | None = None,
     max_groups: int = DEFAULT_LISTWISE_MAX_GROUPS,
     temperature: float = 1.0,
+    min_group_size: int = 1,
 ) -> torch.Tensor:
     if task_weights is None:
         task_weights = torch.tensor(DEFAULT_TASK_WEIGHTS, dtype=labels.dtype, device=labels.device)
     rel = labels @ task_weights
-    return _group_listwise_loss(scores, rel, request_ids, max_groups=max_groups, temperature=temperature)
+    return _group_listwise_loss(
+        scores,
+        rel,
+        request_ids,
+        max_groups=max_groups,
+        temperature=temperature,
+        min_group_size=min_group_size,
+    )
 
 
 def request_single_task_listwise_loss(
@@ -214,18 +236,82 @@ def request_single_task_listwise_loss(
     request_ids: torch.Tensor,
     max_groups: int = DEFAULT_LISTWISE_MAX_GROUPS,
     temperature: float = 1.0,
+    min_group_size: int = 1,
 ) -> torch.Tensor:
-    return _group_listwise_loss(task_scores, task_labels, request_ids, max_groups=max_groups, temperature=temperature)
+    return _group_listwise_loss(
+        task_scores,
+        task_labels,
+        request_ids,
+        max_groups=max_groups,
+        temperature=temperature,
+        min_group_size=min_group_size,
+    )
 
 
-def info_nce_loss(a: torch.Tensor, b: torch.Tensor, temperature: float = 0.2) -> torch.Tensor:
-    if a.numel() == 0 or b.numel() == 0 or a.size(0) < 2:
-        return a.new_tensor(0.0)
-    a = F.normalize(a, dim=-1)
-    b = F.normalize(b, dim=-1)
-    logits = a @ b.T / temperature
-    target = torch.arange(a.size(0), device=a.device)
-    return (F.cross_entropy(logits, target) + F.cross_entropy(logits.T, target)) * 0.5
+def request_topk_coverage_loss(
+    scores: torch.Tensor,
+    labels: torch.Tensor,
+    request_ids: torch.Tensor,
+    task_weights: torch.Tensor | None = None,
+    topk: int = 20,
+    max_groups: int = DEFAULT_LISTWISE_MAX_GROUPS,
+    temperature: float = 0.05,
+    margin: float = 0.0,
+    min_group_size: int | None = None,
+) -> torch.Tensor:
+    if scores.numel() == 0:
+        return scores.new_tensor(0.0)
+    max_groups = max(int(max_groups), 0)
+    if max_groups == 0:
+        return scores.new_tensor(0.0)
+    if task_weights is None:
+        task_weights = torch.tensor(DEFAULT_TASK_WEIGHTS, dtype=labels.dtype, device=labels.device)
+    topk = max(int(topk), 1)
+    temperature = max(float(temperature), 1e-6)
+    margin = float(margin)
+    min_group_size = topk if min_group_size is None else max(int(min_group_size), topk)
+
+    order = torch.argsort(request_ids)
+    sorted_request_ids = request_ids[order]
+    sorted_scores = scores[order]
+    sorted_labels = labels[order]
+    _, counts = torch.unique_consecutive(sorted_request_ids, return_counts=True)
+    starts = torch.cat([counts.new_zeros(1), counts.cumsum(0)[:-1]])
+    starts_list = starts.detach().cpu().tolist()
+    counts_list = counts.detach().cpu().tolist()
+
+    weighted_losses = []
+    used_weights = []
+    used_groups = 0
+    for start, count in zip(starts_list, counts_list):
+        if count <= min_group_size:
+            continue
+        end = start + count
+        group_scores = sorted_scores[start:end]
+        group_labels = sorted_labels[start:end]
+        threshold = torch.topk(group_scores.detach(), k=topk).values[-1]
+        group_used = False
+        for task_idx in range(min(labels.size(-1), len(TASK_NAMES))):
+            weight = task_weights[task_idx].clamp_min(0)
+            if weight <= 0:
+                continue
+            pos_scores = group_scores[group_labels[:, task_idx] > 0]
+            if pos_scores.numel() == 0:
+                continue
+            if pos_scores.numel() == 1:
+                smooth_pos = pos_scores.squeeze(0)
+            else:
+                smooth_pos = temperature * torch.logsumexp(pos_scores / temperature, dim=0)
+            weighted_losses.append(weight * F.softplus((threshold + margin - smooth_pos) / temperature))
+            used_weights.append(weight)
+            group_used = True
+        if group_used:
+            used_groups += 1
+            if used_groups >= max_groups:
+                break
+    if not weighted_losses:
+        return scores.new_tensor(0.0)
+    return torch.stack(weighted_losses).sum() / torch.stack(used_weights).sum().clamp_min(1e-12)
 
 
 def masked_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
@@ -236,7 +322,12 @@ def masked_cross_entropy(logits: torch.Tensor, target: torch.Tensor) -> torch.Te
     return F.cross_entropy(logits[mask], target[mask])
 
 
-def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], cfg: dict) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+def compute_loss(
+    outputs: dict[str, torch.Tensor],
+    batch: dict[str, torch.Tensor],
+    cfg: dict,
+    topk: int = 20,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     labels = batch["labels"]
     logits = outputs["logits"]
     task_weights = _task_tensor(cfg, "task_weights", "", DEFAULT_TASK_WEIGHTS, labels.dtype, labels.device)
@@ -253,29 +344,40 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
 
     bpr_weight = float(cfg.get("bpr_weight", 0.1))
     task_bpr_weight = float(cfg.get("task_bpr_weight", 0.0))
+    hard_bpr_weight = float(cfg.get("hard_bpr_weight", cfg.get("hard_rank_loss_weight", 0.0)))
+    hard_task_bpr_weight = float(cfg.get("hard_task_bpr_weight", 0.0))
     bpr_max_groups = int(cfg.get("bpr_max_groups", DEFAULT_BPR_MAX_GROUPS))
     bpr_max_pairs_per_group = int(cfg.get("bpr_max_pairs_per_group", DEFAULT_BPR_MAX_PAIRS_PER_GROUP))
     listwise_weight = float(cfg.get("listwise_weight", 0.0))
+    hard_listwise_weight = float(cfg.get("hard_listwise_weight", cfg.get("hard_rank_loss_weight", 0.0)))
     collect_listwise_weight = float(cfg.get("collect_listwise_weight", 0.0))
     share_listwise_weight = float(cfg.get("share_listwise_weight", 0.0))
+    hard_collect_listwise_weight = float(cfg.get("hard_collect_listwise_weight", 0.0))
+    hard_share_listwise_weight = float(cfg.get("hard_share_listwise_weight", 0.0))
+    topk_coverage_weight = float(cfg.get("topk_coverage_weight", 0.0))
+    topk_coverage_max_groups = int(cfg.get("topk_coverage_max_groups", DEFAULT_LISTWISE_MAX_GROUPS))
+    topk_coverage_temperature = float(cfg.get("topk_coverage_temperature", 0.05))
+    topk_coverage_margin = float(cfg.get("topk_coverage_margin", 0.0))
     listwise_max_groups = int(cfg.get("listwise_max_groups", DEFAULT_LISTWISE_MAX_GROUPS))
     listwise_temperature = float(cfg.get("listwise_temperature", 1.0))
-    legacy_transition_weight = float(cfg.get("transition_weight", 0.0))
-    type_transition_weight = float(cfg.get("type_transition_weight", legacy_transition_weight))
+    rank_min_group = int(cfg.get("rank_loss_min_group_size", 1))
+    hard_rank_min_group = int(cfg.get("hard_rank_loss_min_group_size", topk))
+    type_transition_weight = float(cfg.get("type_transition_weight", 0.0))
     taxonomy_transition_weight = float(cfg.get("taxonomy_transition_weight", 0.0))
-    contrastive_weight = float(cfg.get("contrastive_weight", 0.05))
     aux_like_weight = float(cfg.get("aux_like_weight", 0.0))
     aux_comment_weight = float(cfg.get("aux_comment_weight", 0.0))
     aux_page_time_weight = float(cfg.get("aux_page_time_weight", 0.0))
+    rank_scores = outputs["weighted_prob_score"] if "weighted_prob_score" in outputs else outputs["final_score"]
 
     bpr = (
         request_bpr_loss(
-            outputs["final_score"],
+            rank_scores,
             labels,
             batch["request_id"],
             task_weights,
             max_groups=bpr_max_groups,
             max_pairs_per_group=bpr_max_pairs_per_group,
+            min_group_size=rank_min_group,
         )
         if bpr_weight > 0
         else logits.new_tensor(0.0)
@@ -288,20 +390,61 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
             task_weights,
             max_groups=bpr_max_groups,
             max_pairs_per_group=bpr_max_pairs_per_group,
+            min_group_size=rank_min_group,
         )
         if task_bpr_weight > 0
         else logits.new_tensor(0.0)
     )
+    hard_bpr = (
+        request_bpr_loss(
+            rank_scores,
+            labels,
+            batch["request_id"],
+            task_weights,
+            max_groups=bpr_max_groups,
+            max_pairs_per_group=bpr_max_pairs_per_group,
+            min_group_size=hard_rank_min_group,
+        )
+        if hard_bpr_weight > 0
+        else logits.new_tensor(0.0)
+    )
+    hard_task_bpr = (
+        request_task_bpr_loss(
+            logits,
+            labels,
+            batch["request_id"],
+            task_weights,
+            max_groups=bpr_max_groups,
+            max_pairs_per_group=bpr_max_pairs_per_group,
+            min_group_size=hard_rank_min_group,
+        )
+        if hard_task_bpr_weight > 0
+        else logits.new_tensor(0.0)
+    )
     listwise = (
         request_listwise_loss(
-            outputs["final_score"],
+            rank_scores,
             labels,
             batch["request_id"],
             task_weights,
             max_groups=listwise_max_groups,
             temperature=listwise_temperature,
+            min_group_size=rank_min_group,
         )
         if listwise_weight > 0
+        else logits.new_tensor(0.0)
+    )
+    hard_listwise = (
+        request_listwise_loss(
+            rank_scores,
+            labels,
+            batch["request_id"],
+            task_weights,
+            max_groups=listwise_max_groups,
+            temperature=listwise_temperature,
+            min_group_size=hard_rank_min_group,
+        )
+        if hard_listwise_weight > 0
         else logits.new_tensor(0.0)
     )
     collect_listwise = (
@@ -311,8 +454,21 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
             batch["request_id"],
             max_groups=listwise_max_groups,
             temperature=listwise_temperature,
+            min_group_size=rank_min_group,
         )
         if collect_listwise_weight > 0
+        else logits.new_tensor(0.0)
+    )
+    hard_collect_listwise = (
+        request_single_task_listwise_loss(
+            logits[:, 1],
+            labels[:, 1],
+            batch["request_id"],
+            max_groups=listwise_max_groups,
+            temperature=listwise_temperature,
+            min_group_size=hard_rank_min_group,
+        )
+        if hard_collect_listwise_weight > 0
         else logits.new_tensor(0.0)
     )
     share_listwise = (
@@ -322,8 +478,36 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
             batch["request_id"],
             max_groups=listwise_max_groups,
             temperature=listwise_temperature,
+            min_group_size=rank_min_group,
         )
         if share_listwise_weight > 0
+        else logits.new_tensor(0.0)
+    )
+    hard_share_listwise = (
+        request_single_task_listwise_loss(
+            logits[:, 2],
+            labels[:, 2],
+            batch["request_id"],
+            max_groups=listwise_max_groups,
+            temperature=listwise_temperature,
+            min_group_size=hard_rank_min_group,
+        )
+        if hard_share_listwise_weight > 0
+        else logits.new_tensor(0.0)
+    )
+    topk_coverage = (
+        request_topk_coverage_loss(
+            rank_scores,
+            labels,
+            batch["request_id"],
+            task_weights=task_weights,
+            topk=topk,
+            max_groups=topk_coverage_max_groups,
+            temperature=topk_coverage_temperature,
+            margin=topk_coverage_margin,
+            min_group_size=hard_rank_min_group,
+        )
+        if topk_coverage_weight > 0
         else logits.new_tensor(0.0)
     )
     type_transition = (
@@ -334,11 +518,6 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
     taxonomy_transition = (
         masked_cross_entropy(outputs["taxonomy_transition_logits"], batch["target_taxonomy_id"])
         if taxonomy_transition_weight > 0 and "taxonomy_transition_logits" in outputs
-        else logits.new_tensor(0.0)
-    )
-    contrastive = (
-        info_nce_loss(outputs["text_repr"], outputs["image_repr"])
-        if contrastive_weight > 0 and "text_repr" in outputs and "image_repr" in outputs
         else logits.new_tensor(0.0)
     )
     aux_like = (
@@ -373,12 +552,17 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         task_loss
         + bpr_weight * bpr
         + task_bpr_weight * task_bpr
+        + hard_bpr_weight * hard_bpr
+        + hard_task_bpr_weight * hard_task_bpr
         + listwise_weight * listwise
+        + hard_listwise_weight * hard_listwise
         + collect_listwise_weight * collect_listwise
         + share_listwise_weight * share_listwise
+        + hard_collect_listwise_weight * hard_collect_listwise
+        + hard_share_listwise_weight * hard_share_listwise
+        + topk_coverage_weight * topk_coverage
         + type_transition_weight * type_transition
         + taxonomy_transition_weight * taxonomy_transition
-        + contrastive_weight * contrastive
         + aux_like_weight * aux_like
         + aux_comment_weight * aux_comment
         + aux_page_time_weight * aux_page_time
@@ -391,13 +575,18 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
         "bce_share_loss": bce[2].detach(),
         "bpr_loss": bpr.detach(),
         "task_bpr_loss": task_bpr.detach(),
+        "hard_bpr_loss": hard_bpr.detach(),
+        "hard_task_bpr_loss": hard_task_bpr.detach(),
         "listwise_loss": listwise.detach(),
+        "hard_listwise_loss": hard_listwise.detach(),
         "collect_listwise_loss": collect_listwise.detach(),
         "share_listwise_loss": share_listwise.detach(),
+        "hard_collect_listwise_loss": hard_collect_listwise.detach(),
+        "hard_share_listwise_loss": hard_share_listwise.detach(),
+        "topk_coverage_loss": topk_coverage.detach(),
         "transition_loss": type_transition.detach(),
         "type_transition_loss": type_transition.detach(),
         "taxonomy_transition_loss": taxonomy_transition.detach(),
-        "contrastive_loss": contrastive.detach(),
         "aux_like_loss": aux_like.detach(),
         "aux_comment_loss": aux_comment.detach(),
         "aux_page_time_loss": aux_page_time.detach(),

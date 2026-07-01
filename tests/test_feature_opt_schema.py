@@ -9,7 +9,6 @@ import pandas as pd
 from heterointent.data.dataset import RankingDataset
 from heterointent.data.qilin import convert_qilin_directory
 from scripts.compact_processed_features import compact_processed_dir
-from scripts.merge_embeddings import merge_embeddings
 
 
 def _write_minimal_qilin_raw(root: Path) -> None:
@@ -151,7 +150,6 @@ def test_qilin_conversion_emits_feature_opt_schema(tmp_path: Path) -> None:
         "cold_stage_id",
         "has_query",
         "has_image_emb",
-        "has_video_emb",
         "history_text_feat_0",
         "history_ratio_feat_0",
     }
@@ -179,45 +177,6 @@ def test_qilin_conversion_emits_feature_opt_schema(tmp_path: Path) -> None:
     assert np.isfinite(values).all()
     assert not any(col.startswith(("like_feat_", "comment_feat_", "page_time_log_feat_")) for col in train.columns)
     assert (processed / "feature_standardization.json").exists()
-
-
-def test_merge_embeddings_adds_query_and_separate_visual_groups(tmp_path: Path) -> None:
-    processed = tmp_path / "processed"
-    output = tmp_path / "merged"
-    processed.mkdir()
-    base = pd.DataFrame(
-        {
-            "request_id": [1, 2],
-            "item_id": [1, 2],
-            "image_meta_feat_0": [0.0, 1.0],
-        }
-    )
-    for split in ("train", "valid", "test"):
-        base.to_parquet(processed / f"{split}.parquet", index=False)
-    (processed / "metadata.json").write_text(
-        json.dumps({"num_users": 1, "num_items": 3, "num_item_types": 1, "num_taxonomies": 1, "max_history": 3}),
-        encoding="utf-8",
-    )
-    np.save(processed / "query_embeddings.npy", np.ones((2, 3), dtype="float32"))
-    np.save(processed / "query_embedding_request_ids.npy", np.array([1, 2], dtype="int64"))
-    np.save(processed / "image_embeddings.npy", np.ones((2, 4), dtype="float32"))
-    np.save(processed / "image_embedding_item_ids.npy", np.array([1, 2], dtype="int64"))
-
-    merge_embeddings(
-        processed_dir=processed,
-        output_dir=output,
-        enabled={"query": True, "image": True},
-    )
-
-    merged = pd.read_parquet(output / "train.parquet")
-    metadata = json.loads((output / "metadata.json").read_text(encoding="utf-8"))
-
-    assert "query_feat_0" in merged.columns
-    assert "image_emb_feat_0" in merged.columns
-    assert "image_meta_feat_1" in merged.columns
-    assert metadata["query_dim"] == 3
-    assert metadata["image_emb_dim"] == 4
-    assert metadata["image_meta_dim"] == 2
 
 
 def test_compact_processed_features_uses_sidecar_lookup(tmp_path: Path) -> None:
@@ -342,7 +301,6 @@ def test_build_processed_compact_mock_visual(tmp_path: Path) -> None:
         build_text=False,
         build_visual=True,
         image_root=image_root,
-        visual_modalities=("image",),
         visual_mock_encoder=True,
         visual_output_dim=4,
         skip_existing_embeddings=False,

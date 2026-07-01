@@ -23,10 +23,16 @@ GATE_COLUMNS = [
     "gate_item_type",
     "gate_taxonomy",
     "gate_position",
-    "gate_text",
-    "gate_image",
-    "gate_video",
-    "gate_dense",
+    "gate_taxonomy1",
+    "gate_taxonomy2",
+    "gate_text_fused",
+    "gate_text_stat",
+    "gate_image_meta",
+    "gate_video_meta",
+    "gate_image_emb",
+    "gate_item_dense",
+    "gate_ratio",
+    "gate_cold_stage",
     "gate_graph",
 ]
 ATTENTION_COLUMNS = ["attention_type_target_mass", "attention_taxonomy_target_mass"]
@@ -62,13 +68,6 @@ def _score_weights(config: dict[str, Any]) -> dict[str, float]:
     return {task: float(values.get(task, TASK_WEIGHTS[task])) for task in TASKS}
 
 
-def _rank_blend(config: dict[str, Any]) -> float:
-    model_cfg = config.get("model", {})
-    if not bool(model_cfg.get("use_rank_head", False)):
-        return 0.0
-    return min(max(float(model_cfg.get("rank_score_blend", 0.5)), 0.0), 1.0)
-
-
 def _candidate_stats(samples: pd.DataFrame) -> dict[str, Any]:
     positives = samples.groupby("request_id")[list(TASKS)].sum()
     request_items = samples.groupby("request_id")["item_id"].nunique()
@@ -91,12 +90,6 @@ def _enrich_predictions(pred: pd.DataFrame, samples: pd.DataFrame, config: dict[
     out = pred.merge(meta, on=["request_id", "item_id"], how="left")
     weights = _score_weights(config)
     out["weighted_prob_score"] = sum(weights[task] * out[f"p_{task}"].astype(float) for task in TASKS)
-    blend = _rank_blend(config)
-    if blend > 1e-12:
-        raw_rank_score = (out["score"].astype(float) - (1.0 - blend) * out["weighted_prob_score"]) / blend
-        out["rank_score"] = raw_rank_score.clip(lower=0.0, upper=1.0)
-    else:
-        out["rank_score"] = np.nan
     out["final_score"] = out["score"].astype(float)
     return out
 
@@ -130,27 +123,11 @@ def _read_thumbnail_index(path: Path, source: str) -> pd.DataFrame:
 
 def _load_thumbnail_lookup(processed_dir: Path) -> pd.DataFrame:
     image = _read_thumbnail_index(processed_dir / "image_embedding_items.parquet", "image")
-    video = _read_thumbnail_index(processed_dir / "video_embedding_items.parquet", "video")
-    if image.empty and video.empty:
-        return pd.DataFrame(columns=["item_id", *THUMBNAIL_COLUMNS])
     if image.empty:
-        lookup = video.copy()
-    elif video.empty:
-        lookup = image.copy()
-    else:
-        lookup = image.merge(video, on="item_id", how="outer")
-    for col in ["image_thumbnail_path", "video_thumbnail_path"]:
-        if col not in lookup:
-            lookup[col] = ""
-    lookup["thumbnail_path"] = lookup["image_thumbnail_path"].where(
-        lookup["image_thumbnail_path"].astype(str).ne(""),
-        lookup["video_thumbnail_path"],
-    )
-    lookup["thumbnail_source"] = np.where(
-        lookup["image_thumbnail_path"].astype(str).ne(""),
-        "image",
-        np.where(lookup["video_thumbnail_path"].astype(str).ne(""), "video", ""),
-    )
+        return pd.DataFrame(columns=["item_id", *THUMBNAIL_COLUMNS])
+    lookup = image.copy()
+    lookup["thumbnail_path"] = lookup["image_thumbnail_path"].fillna("")
+    lookup["thumbnail_source"] = np.where(lookup["thumbnail_path"].astype(str).ne(""), "image", "")
     return lookup[["item_id", *THUMBNAIL_COLUMNS]]
 
 
@@ -197,9 +174,9 @@ def _case_explanation(row: pd.Series) -> str:
         parts.append("该请求展示了常规 Top-20 推荐排序与多目标概率输出。")
     if row["intent_strength"] >= 0.5:
         parts.append("attention target mass 较高，用户历史意图信号比较清晰。")
-    if row["dominant_gate"] in {"graph", "text", "dense"}:
+    if row["dominant_gate"] in {"graph", "text_fused", "text_stat", "item_dense", "ratio"}:
         parts.append(f"{row['dominant_gate']} gate 较高，说明该模态对排序贡献明显。")
-    if row["dominant_gate"] in {"image", "video"}:
+    if row["dominant_gate"] in {"image_meta", "video_meta", "image_emb"}:
         parts.append(f"{row['dominant_gate']} gate is high, showing real thumbnail contribution.")
     elif row.get("thumbnail_hits", 0) > 0:
         parts.append("This request has local thumbnails in Top-20, so it is suitable for visual-result display.")
@@ -230,7 +207,7 @@ def _build_cases(valid_top20: pd.DataFrame, valid_samples: pd.DataFrame, limit: 
         cases["intent_strength"] = cases[attn_cols].mean(axis=1)
     else:
         cases["intent_strength"] = 0.0
-    visual_gate_cols = [col for col in ["gate_image", "gate_video"] if col in cases]
+    visual_gate_cols = [col for col in ["gate_image_meta", "gate_video_meta", "gate_image_emb"] if col in cases]
     cases["visual_gate_strength"] = cases[visual_gate_cols].sum(axis=1) if visual_gate_cols else 0.0
     cases["dominant_gate"] = cases.apply(_dominant_gate, axis=1)
     cases["case_score"] = (
@@ -239,7 +216,7 @@ def _build_cases(valid_top20: pd.DataFrame, valid_samples: pd.DataFrame, limit: 
         + 45 * cases["share_positive"].gt(0).astype(int)
         + 35 * cases["collect_positive"].gt(0).astype(int)
         + 20 * cases["candidate_count"].gt(20).astype(int)
-        + 15 * cases["dominant_gate"].isin(["image", "video"]).astype(int)
+        + 15 * cases["dominant_gate"].isin(["image_meta", "video_meta", "image_emb"]).astype(int)
         + 15 * cases.get("thumbnail_hits", pd.Series(0, index=cases.index)).gt(0).astype(int)
         + 10 * cases["visual_gate_strength"].clip(0, 1)
         + 10 * cases["intent_strength"].clip(0, 1)
@@ -277,7 +254,7 @@ def _case_tags(row: pd.Series) -> str:
         tags.append("hard")
     if row["intent_strength"] >= 0.5:
         tags.append("intent")
-    if row.get("dominant_gate", "") in {"image", "video"} or row.get("thumbnail_hits", 0) > 0:
+    if row.get("dominant_gate", "") in {"image_meta", "video_meta", "image_emb"} or row.get("thumbnail_hits", 0) > 0:
         tags.append("visual")
     if not tags:
         tags.append("general")
@@ -383,7 +360,7 @@ def _best_metric_row(metrics_path: Path) -> dict[str, Any]:
     df = pd.read_csv(metrics_path)
     if df.empty:
         return {}
-    metric = "quality_score" if "quality_score" in df.columns else "weighted_hit@20"
+    metric = "native_selection_score" if "native_selection_score" in df.columns else "official_weighted_hit@20"
     if metric not in df:
         return {}
     row = df.loc[df[metric].idxmax()].to_dict()
@@ -402,7 +379,7 @@ def _write_report(output_dir: Path, overview: dict[str, Any], cases: pd.DataFram
         "",
         "- 任务不是单纯预测点击，而是在同一 request 候选集中完成 click / collect / share 多目标 Top-20 排序。",
         "- collect/share 是极稀疏高价值行为，因此需要展示模型如何识别高价值意图，而不只展示一个总分。",
-        "- 当前温和版使用 request-preserving 排序训练、温和样本重加权和 rank_score_head，在排序质量和稀疏行为识别上更适合讲解。",
+        "- 当前主线使用官方线性分数、native 选模指标和 hard/rare 分档诊断，避免被简单请求的 Top-20 饱和现象误导。",
         "",
         "## 数据挑战",
         "",
@@ -410,9 +387,7 @@ def _write_report(output_dir: Path, overview: dict[str, Any], cases: pd.DataFram
         "| --- | ---: | ---: |",
     ]
     for task in TASKS:
-        lines.append(
-            f"| {task} | {train['row_positive_rate'][task]:.6f} | {train['request_positive_rate'][task]:.6f} |"
-        )
+        lines.append(f"| {task} | {train['row_positive_rate'][task]:.6f} | {train['request_positive_rate'][task]:.6f} |")
     lines.extend(
         [
             "",
@@ -446,8 +421,8 @@ def _write_report(output_dir: Path, overview: dict[str, Any], cases: pd.DataFram
             "",
             "1. 先打开 Overview，展示样本不均衡和核心指标。",
             "2. 切到 Showcase Cases，选择 share 或 collect 标签案例。",
-            "3. 在 Request Explorer 中点击 Top-20 item，展示三任务概率、rank_score_head 和模态 gate。",
-            "4. 用 Why This Rank 说明模型不是黑盒，而是能解释分数来源和意图信号。",
+            "3. 在 Request Explorer 中点击 Top-20 item，展示三任务概率、官方线性分数和模态 gate。",
+            "4. 用 Why This Rank 说明模型不是黑箱，而是能解释分数来源和意图信号。",
         ]
     )
     (output_dir / "defense_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -497,7 +472,6 @@ def export_showcase(args: argparse.Namespace) -> dict[str, Any]:
         "processed_dir": str(processed_dir),
         "topk": int(args.topk),
         "score_weights": _score_weights(config),
-        "rank_score_blend": _rank_blend(config),
         "dataset": {
             "train": _candidate_stats(train_samples),
             "valid": _candidate_stats(valid_samples),
@@ -555,7 +529,6 @@ def _showcase_columns(df: pd.DataFrame) -> list[str]:
         "score",
         "final_score",
         "weighted_prob_score",
-        "rank_score",
         "p_click",
         "p_collect",
         "p_share",
@@ -581,14 +554,14 @@ def _showcase_columns(df: pd.DataFrame) -> list[str]:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Export lightweight offline showcase data for the HeteroIntent demo app.")
-    parser.add_argument("--processed-dir", default="data/processed/qilin_full_multimodal_meta")
-    parser.add_argument("--run-dir", default="outputs/qilin_score_opt_mild")
+    parser.add_argument("--processed-dir", default="data/run_latest/processed/qilin_full_feature_opt_v2_compact")
+    parser.add_argument("--run-dir", default="outputs/run_latest/qilin_feature_opt_v2_history_compact")
     parser.add_argument("--checkpoint", default=None)
-    parser.add_argument("--config", default="configs/qilin_score_opt_mild.yaml")
-    parser.add_argument("--output-dir", default="outputs/showcase")
+    parser.add_argument("--config", default="configs/qilin_feature_opt_v2_history_compact.yaml")
+    parser.add_argument("--output-dir", default="outputs/showcase_run_latest")
     parser.add_argument("--valid-predictions", default="valid_predictions.parquet")
     parser.add_argument("--submission", default="submission_top20_dedup.csv")
-    parser.add_argument("--thumbnail-index-dir", default=None, help="Directory containing image/video_embedding_items.parquet.")
+    parser.add_argument("--thumbnail-index-dir", default=None, help="Directory containing image_embedding_items.parquet.")
     parser.add_argument("--topk", type=int, default=20)
     parser.add_argument("--max-cases", type=int, default=120)
     args = parser.parse_args()

@@ -17,9 +17,6 @@ def _metadata() -> dict:
         "num_item_types": 4,
         "num_taxonomies": 6,
         "text_dim": 0,
-        "image_dim": 0,
-        "video_dim": 0,
-        "dense_dim": 0,
         "max_history": 3,
     }
 
@@ -74,18 +71,6 @@ def test_score_weights_control_final_score() -> None:
     outputs = model(_batch())
 
     assert torch.allclose(outputs["final_score"], outputs["probs"][:, 0])
-
-
-def test_rank_head_can_drive_final_score() -> None:
-    cfg = _config()
-    cfg["model"]["use_rank_head"] = True
-    cfg["model"]["rank_score_blend"] = 1.0
-    model = HeteroIntentPLE(_metadata(), cfg)
-    outputs = model(_batch())
-
-    assert "rank_logit" in outputs
-    assert "rank_score" in outputs
-    assert torch.allclose(outputs["final_score"], outputs["rank_score"])
 
 
 def test_request_preserving_loader_does_not_split_request_groups(tmp_path) -> None:

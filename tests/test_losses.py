@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from heterointent.training.losses import compute_loss, focal_bce_with_logits, request_listwise_loss
+from heterointent.training.losses import compute_loss, focal_bce_with_logits, request_listwise_loss, request_topk_coverage_loss
 
 
 def test_positive_weights_increase_sparse_task_bce() -> None:
@@ -56,7 +56,6 @@ def test_compute_loss_reports_multi_objective_components() -> None:
         "task_bpr_weight": 0.02,
         "type_transition_weight": 0.0,
         "taxonomy_transition_weight": 0.0,
-        "contrastive_weight": 0.0,
     }
 
     loss, logs = compute_loss(outputs, batch, cfg)
@@ -99,7 +98,6 @@ def test_bounded_bpr_can_be_disabled_by_group_limit() -> None:
         "bpr_max_groups": 0,
         "type_transition_weight": 0.0,
         "taxonomy_transition_weight": 0.0,
-        "contrastive_weight": 0.0,
     }
 
     _, logs = compute_loss(outputs, batch, cfg)
@@ -137,6 +135,29 @@ def test_listwise_loss_handles_edge_cases() -> None:
     assert scores.grad is not None
 
 
+def test_topk_coverage_loss_pushes_task_positive_above_boundary() -> None:
+    scores = torch.tensor([0.9, 0.8, 0.1, 0.7, 0.6], requires_grad=True)
+    labels = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    request_ids = torch.tensor([1, 1, 2, 2, 2])
+
+    small_only = request_topk_coverage_loss(scores[:2], labels[:2], request_ids[:2], topk=2)
+    loss = request_topk_coverage_loss(scores, labels, request_ids, topk=2)
+
+    assert small_only == 0
+    assert loss > 0
+    loss.backward()
+    assert scores.grad is not None
+    assert scores.grad[2] < 0
+
+
 def test_compute_loss_without_intent_heads_and_with_listwise() -> None:
     logits = torch.zeros((4, 3), requires_grad=True)
     labels = torch.tensor(
@@ -167,9 +188,9 @@ def test_compute_loss_without_intent_heads_and_with_listwise() -> None:
         "listwise_weight": 0.03,
         "collect_listwise_weight": 0.04,
         "share_listwise_weight": 0.05,
+        "topk_coverage_weight": 0.02,
         "type_transition_weight": 0.1,
         "taxonomy_transition_weight": 0.1,
-        "contrastive_weight": 0.0,
     }
 
     loss, logs = compute_loss(outputs, batch, cfg)
@@ -178,5 +199,84 @@ def test_compute_loss_without_intent_heads_and_with_listwise() -> None:
     assert logs["listwise_loss"] > 0
     assert logs["collect_listwise_loss"] > 0
     assert logs["share_listwise_loss"] > 0
+    assert logs["topk_coverage_loss"] == 0
     assert logs["type_transition_loss"] == 0
     assert logs["taxonomy_transition_loss"] == 0
+
+
+def test_rank_losses_split_all_requests_and_hard_topk_boundary() -> None:
+    logits = torch.zeros((4, 3), requires_grad=True)
+    labels = torch.tensor(
+        [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, 0.0],
+        ]
+    )
+    outputs = {
+        "logits": logits,
+        "final_score": torch.sigmoid(logits).matmul(torch.tensor([0.3, 0.4, 0.3])),
+    }
+    cfg = {
+        "bpr_weight": 0.03,
+        "task_bpr_weight": 0.02,
+        "listwise_weight": 0.03,
+        "hard_bpr_weight": 0.01,
+        "hard_listwise_weight": 0.01,
+        "collect_listwise_weight": 0.04,
+        "share_listwise_weight": 0.05,
+        "hard_collect_listwise_weight": 0.02,
+        "hard_share_listwise_weight": 0.02,
+        "topk_coverage_weight": 0.02,
+        "rank_loss_min_group_size": 1,
+        "hard_rank_loss_min_group_size": 2,
+        "type_transition_weight": 0.0,
+        "taxonomy_transition_weight": 0.0,
+    }
+    small_labels = torch.tensor([[0.0, 1.0, 0.0], [0.0, 0.0, 0.0]])
+    small_logits = torch.zeros((2, 3), requires_grad=True)
+    small_outputs = {
+        "logits": small_logits,
+        "final_score": torch.sigmoid(small_logits).matmul(torch.tensor([0.3, 0.4, 0.3])),
+    }
+    small_batch = {
+        "labels": small_labels,
+        "request_id": torch.tensor([1, 1]),
+        "next_item_type": torch.zeros(2, dtype=torch.long),
+        "target_item_type": torch.zeros(2, dtype=torch.long),
+        "target_taxonomy_id": torch.zeros(2, dtype=torch.long),
+    }
+
+    _, small_logs = compute_loss(
+        small_outputs,
+        small_batch,
+        cfg,
+        topk=2,
+    )
+
+    assert small_logs["bpr_loss"] > 0
+    assert small_logs["task_bpr_loss"] > 0
+    assert small_logs["listwise_loss"] > 0
+    assert small_logs["collect_listwise_loss"] > 0
+    assert small_logs["hard_bpr_loss"] == 0
+    assert small_logs["hard_listwise_loss"] == 0
+    assert small_logs["topk_coverage_loss"] == 0
+
+    large_batch = {
+        "labels": labels,
+        "request_id": torch.tensor([1, 1, 1, 1]),
+        "next_item_type": torch.zeros(4, dtype=torch.long),
+        "target_item_type": torch.zeros(4, dtype=torch.long),
+        "target_taxonomy_id": torch.zeros(4, dtype=torch.long),
+    }
+    _, large_logs = compute_loss(outputs, large_batch, cfg, topk=2)
+
+    assert large_logs["bpr_loss"] > 0
+    assert large_logs["task_bpr_loss"] > 0
+    assert large_logs["hard_bpr_loss"] > 0
+    assert large_logs["listwise_loss"] > 0
+    assert large_logs["hard_listwise_loss"] > 0
+    assert large_logs["collect_listwise_loss"] > 0
+    assert large_logs["hard_collect_listwise_loss"] > 0
+    assert large_logs["topk_coverage_loss"] > 0

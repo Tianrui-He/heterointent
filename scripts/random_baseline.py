@@ -16,20 +16,19 @@ from heterointent.evaluation.metrics import TASKS, compute_ranking_metrics
 from heterointent.inference.rank import rank_predictions
 
 DEFAULT_METRIC_KEYS = [
-    "weighted_hit@20",
-    "ndcg@20",
+    "native_selection_score",
+    "official_weighted_hit@20",
+    "hard_official_capture",
+    "sparse_ap",
+    "sparse_recall",
+    "rare_score",
     "hard_weighted_hit@20",
     "hard_ndcg@20",
-    "preference_auc",
     "hard_preference_auc",
-    "hit_click@20",
-    "hit_collect@20",
-    "hit_share@20",
-    "request_auc_click",
-    "request_auc_collect",
-    "request_auc_share",
-    "request_ap_collect",
-    "request_ap_share",
+    "hard_request_ap_collect",
+    "hard_request_ap_share",
+    "hard_recall_collect@20",
+    "hard_recall_share@20",
     "candidate_count",
     "candidate_count_gt_topk_rate",
     "num_requests",
@@ -93,8 +92,8 @@ def write_summary_csv(summary_by_split: dict[str, dict[str, dict[str, float | No
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Evaluate a pure random ranking baseline on Qilin processed splits.")
-    parser.add_argument("--processed-dir", default="data/processed/qilin_full_multimodal_meta")
-    parser.add_argument("--output-dir", default="outputs/random_baseline")
+    parser.add_argument("--processed-dir", default="data/run_latest/processed/qilin_full_feature_opt_v2_compact")
+    parser.add_argument("--output-dir", default="outputs/run_latest/random_baseline")
     parser.add_argument("--splits", nargs="+", default=["valid", "test"], choices=["train", "valid", "test"])
     parser.add_argument("--topk", type=int, default=20)
     parser.add_argument("--seed", type=int, default=2026)

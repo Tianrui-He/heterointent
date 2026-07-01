@@ -23,9 +23,11 @@ def make_synthetic_dataset(
     num_item_types: int = 8,
     num_taxonomies: int = 32,
     text_dim: int = 16,
-    image_dim: int = 16,
-    video_dim: int = 8,
-    dense_dim: int = 12,
+    image_meta_dim: int = 4,
+    video_meta_dim: int = 3,
+    image_emb_dim: int = 8,
+    item_dense_dim: int = 12,
+    ratio_dim: int = 6,
     max_history: int = 20,
     seed: int = 2026,
 ) -> dict:
@@ -39,9 +41,11 @@ def make_synthetic_dataset(
     item_type = rng.integers(1, num_item_types + 1, size=num_items + 1)
     taxonomy = rng.integers(1, num_taxonomies + 1, size=num_items + 1)
     text_feat = rng.normal(size=(num_items + 1, text_dim)).astype("float32")
-    image_feat = rng.normal(size=(num_items + 1, image_dim)).astype("float32")
-    video_feat = rng.normal(size=(num_items + 1, video_dim)).astype("float32")
-    dense_feat = rng.normal(size=(num_items + 1, dense_dim)).astype("float32")
+    image_meta_feat = rng.normal(size=(num_items + 1, image_meta_dim)).astype("float32")
+    video_meta_feat = rng.normal(size=(num_items + 1, video_meta_dim)).astype("float32")
+    image_emb_feat = rng.normal(size=(num_items + 1, image_emb_dim)).astype("float32")
+    item_dense_feat = rng.normal(size=(num_items + 1, item_dense_dim)).astype("float32")
+    ratio_feat = rng.normal(size=(num_items + 1, ratio_dim)).astype("float32")
 
     rows: list[dict] = []
     histories = {u: list(rng.integers(1, num_items + 1, size=max_history)) for u in range(1, num_users + 1)}
@@ -63,8 +67,8 @@ def make_synthetic_dataset(
             content_affinity = 0.2 * text_feat[item_id, : min(8, text_dim)].sum()
             position_bias = -0.03 * pos
             click_p = _sigmoid(np.array(type_affinity + content_affinity + position_bias - 0.7))
-            collect_p = _sigmoid(np.array(type_affinity + 0.4 * dense_feat[item_id, 0] - 1.6))
-            share_p = _sigmoid(np.array(type_affinity + 0.3 * image_feat[item_id, 0] - 1.8))
+            collect_p = _sigmoid(np.array(type_affinity + 0.4 * item_dense_feat[item_id, 0] - 1.6))
+            share_p = _sigmoid(np.array(type_affinity + 0.3 * image_emb_feat[item_id, 0] - 1.8))
             click = int(rng.random() < click_p)
             collect = int(click and rng.random() < collect_p)
             share = int(click and rng.random() < share_p)
@@ -82,17 +86,22 @@ def make_synthetic_dataset(
                 "collect": collect,
                 "share": share,
                 "next_item_type": next_type,
+                "has_image_emb": 1,
             }
             for i, h in enumerate(hist):
                 row[f"hist_item_{i}"] = int(h)
             for i, value in enumerate(text_feat[item_id]):
                 row[f"text_feat_{i}"] = float(value)
-            for i, value in enumerate(image_feat[item_id]):
-                row[f"image_feat_{i}"] = float(value)
-            for i, value in enumerate(video_feat[item_id]):
-                row[f"video_feat_{i}"] = float(value)
-            for i, value in enumerate(dense_feat[item_id]):
-                row[f"dense_feat_{i}"] = float(value)
+            for i, value in enumerate(image_meta_feat[item_id]):
+                row[f"image_meta_feat_{i}"] = float(value)
+            for i, value in enumerate(video_meta_feat[item_id]):
+                row[f"video_meta_feat_{i}"] = float(value)
+            for i, value in enumerate(image_emb_feat[item_id]):
+                row[f"image_emb_feat_{i}"] = float(value)
+            for i, value in enumerate(item_dense_feat[item_id]):
+                row[f"item_dense_feat_{i}"] = float(value)
+            for i, value in enumerate(ratio_feat[item_id]):
+                row[f"ratio_feat_{i}"] = float(value)
             rows.append(row)
 
         positives = [int(i) for i in candidates if rng.random() < 0.08 or item_type[i] == next_type]
@@ -124,9 +133,11 @@ def make_synthetic_dataset(
         "num_item_types": num_item_types + 1,
         "num_taxonomies": num_taxonomies + 1,
         "text_dim": text_dim,
-        "image_dim": image_dim,
-        "video_dim": video_dim,
-        "dense_dim": dense_dim,
+        "image_meta_dim": image_meta_dim,
+        "video_meta_dim": video_meta_dim,
+        "image_emb_dim": image_emb_dim,
+        "item_dense_dim": item_dense_dim,
+        "ratio_dim": ratio_dim,
         "max_history": max_history,
         "dynamic_intent": True,
     }

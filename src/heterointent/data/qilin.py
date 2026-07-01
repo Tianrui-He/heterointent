@@ -436,30 +436,73 @@ def _aggregate_history_feature(
 ) -> np.ndarray:
     batch, hist_len = hist_items.shape
     out = np.zeros((batch, out_dim), dtype=np.float32)
-    for row_idx in range(batch):
-        ids = hist_items[row_idx]
-        valid = ids[(ids > 0) & (ids < lookup.shape[0])]
-        if valid.size == 0:
+    if batch == 0 or hist_len == 0:
+        return out
+    if mode == "last":
+        filled = np.zeros(batch, dtype=bool)
+        for pos in range(hist_len - 1, -1, -1):
+            ids = hist_items[:, pos]
+            valid = (ids > 0) & (ids < lookup.shape[0]) & ~filled
+            if not bool(valid.any()):
+                continue
+            out[valid] = lookup[ids[valid]]
+            filled[valid] = True
+            if bool(filled.all()):
+                break
+        return out
+    counts = np.zeros(batch, dtype=np.float32)
+    for pos in range(hist_len):
+        ids = hist_items[:, pos]
+        valid = (ids > 0) & (ids < lookup.shape[0])
+        if not bool(valid.any()):
             continue
-        values = lookup[valid]
-        if mode == "last":
-            out[row_idx] = values[-1]
-        else:
-            out[row_idx] = values.mean(axis=0)
+        out[valid] += lookup[ids[valid]]
+        counts[valid] += 1.0
+    nonzero = counts > 0
+    out[nonzero] /= counts[nonzero, None]
     return out
 
 
-def _add_history_semantic_summary(df: pd.DataFrame, notes: pd.DataFrame, max_history: int) -> pd.DataFrame:
+def build_text_lookup_from_sidecar(
+    processed_dir: Path,
+    *,
+    values_name: str = "text_embeddings.npy",
+    ids_name: str = "text_embedding_item_ids.npy",
+    out_dim: int = HISTORY_TEXT_SUMMARY_DIM,
+) -> np.ndarray:
+    values_path = processed_dir / values_name
+    ids_path = processed_dir / ids_name
+    if not values_path.exists() or not ids_path.exists():
+        return np.zeros((1, out_dim), dtype=np.float32)
+    item_ids = np.load(ids_path).astype(np.int64, copy=False)
+    text_values = np.load(values_path, mmap_mode="r")
+    max_id = int(item_ids.max(initial=0)) + 1
+    lookup = np.zeros((max_id, out_dim), dtype=np.float32)
+    use_dim = min(int(text_values.shape[1]), out_dim)
+    lookup[item_ids] = np.asarray(text_values[:, :use_dim], dtype=np.float32)
+    return lookup
+
+
+def _add_history_semantic_summary(
+    df: pd.DataFrame,
+    notes: pd.DataFrame,
+    max_history: int,
+    *,
+    text_lookup: np.ndarray | None = None,
+    ratio_lookup: np.ndarray | None = None,
+) -> pd.DataFrame:
     hist_cols = history_columns(max_history)
     hist_items = df[hist_cols].to_numpy(dtype=np.int64, copy=False)
-    text_prefixes = ("text_feat_", "text_title_feat_", "text_content_feat_", "text_stat_feat_")
-    text_lookup = np.zeros((1, HISTORY_TEXT_SUMMARY_DIM), dtype=np.float32)
-    for prefix in text_prefixes:
-        lookup = _build_item_feature_lookup(notes, prefix, HISTORY_TEXT_SUMMARY_DIM)
-        if lookup.shape[0] > 1:
-            text_lookup = lookup
-            break
-    ratio_lookup = _build_item_feature_lookup(notes, "ratio_feat_", HISTORY_RATIO_SUMMARY_DIM)
+    if text_lookup is None:
+        text_prefixes = ("text_feat_", "text_title_feat_", "text_content_feat_", "text_stat_feat_")
+        text_lookup = np.zeros((1, HISTORY_TEXT_SUMMARY_DIM), dtype=np.float32)
+        for prefix in text_prefixes:
+            lookup = _build_item_feature_lookup(notes, prefix, HISTORY_TEXT_SUMMARY_DIM)
+            if lookup.shape[0] > 1:
+                text_lookup = lookup
+                break
+    if ratio_lookup is None:
+        ratio_lookup = _build_item_feature_lookup(notes, "ratio_feat_", HISTORY_RATIO_SUMMARY_DIM)
     text_mean = _aggregate_history_feature(hist_items, text_lookup, HISTORY_TEXT_SUMMARY_DIM, mode="mean")
     text_last = _aggregate_history_feature(hist_items, text_lookup, HISTORY_TEXT_SUMMARY_DIM, mode="last")
     ratio_mean = _aggregate_history_feature(hist_items, ratio_lookup, HISTORY_RATIO_SUMMARY_DIM, mode="mean")
@@ -504,7 +547,6 @@ def build_note_features(notes_df: pd.DataFrame, item_map: dict[int, int], text_h
 
     imp = _safe_float(note, "imp_num")
     click = _safe_float(note, "click_num")
-    duration = _safe_float(note, "video_duration")
     path_lists = _image_path_lists(note)
     path_count = pd.Series([len(paths) for paths in path_lists], index=note.index, dtype="float32")
     features["cold_stage_id"] = _cold_stage_from_imp(imp).reset_index(drop=True)
@@ -512,7 +554,6 @@ def build_note_features(notes_df: pd.DataFrame, item_map: dict[int, int], text_h
     features["item_imp_bucket"] = pd.cut(imp, bins=[-np.inf, 9.0, 99.0, 999.0, np.inf], labels=[0, 1, 2, 3]).astype("int8").reset_index(drop=True)
     features["item_click_bucket"] = pd.cut(click, bins=[-np.inf, 0.0, 9.0, 99.0, np.inf], labels=[0, 1, 2, 3]).astype("int8").reset_index(drop=True)
     features["has_image_emb"] = ((note["image_num"].fillna(0.0).gt(0) if "image_num" in note.columns else False) | path_count.gt(0)).astype("int8").reset_index(drop=True)
-    features["has_video_emb"] = duration.gt(0).astype("int8").reset_index(drop=True)
 
     image_meta = build_image_meta_features(note).reset_index(drop=True)
     video_meta = build_video_meta_features(note).reset_index(drop=True)
@@ -708,7 +749,7 @@ def convert_qilin_directory(qilin_dir: str | Path, output_dir: str | Path, max_h
             df["has_query"] = df["query"].fillna("").astype(str).str.len().gt(0).astype("int8")
         else:
             df["has_query"] = 0
-        for col in ["cold_stage_id", "item_imp_bucket", "item_click_bucket", "has_image_emb", "has_video_emb"]:
+        for col in ["cold_stage_id", "item_imp_bucket", "item_click_bucket", "has_image_emb"]:
             if col in df.columns:
                 df[col] = df[col].fillna(0).astype("int8")
         return df

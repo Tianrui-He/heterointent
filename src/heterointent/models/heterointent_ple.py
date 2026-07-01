@@ -40,9 +40,6 @@ class HeteroIntentPLE(nn.Module):
         self.use_computed_cross = bool(model_cfg.get("use_computed_cross", False))
         self.use_query_interaction = bool(model_cfg.get("use_query_interaction", False))
         self.task_text_residual_weight = float(model_cfg.get("task_text_residual_weight", 0.0))
-        self.use_rank_head = bool(model_cfg.get("use_rank_head", False))
-        default_rank_blend = 0.5 if self.use_rank_head else 0.0
-        self.rank_score_blend = min(max(float(model_cfg.get("rank_score_blend", default_rank_blend)), 0.0), 1.0)
         encoder_cfg = {
             "use_text_fusion_gate": bool(model_cfg.get("use_text_fusion_gate", False)),
             "use_cold_stage_gate": bool(model_cfg.get("use_cold_stage_gate", False)),
@@ -55,7 +52,6 @@ class HeteroIntentPLE(nn.Module):
             max_position=int(model_cfg.get("max_position", 200)),
             dropout=dropout,
             use_graph_embedding=use_graph,
-            disabled_modalities=list(model_cfg.get("disabled_modalities", [])),
             encoder_cfg=encoder_cfg,
         )
         self.item_encoder.set_graph_trainable(bool(model_cfg.get("graph_embedding_trainable", False)))
@@ -133,8 +129,6 @@ class HeteroIntentPLE(nn.Module):
             if self.task_text_residual_weight > 0
             else None
         )
-        if self.use_rank_head:
-            self.rank_score_head = nn.Linear(hidden_dim, 1)
         if self.enable_aux_heads:
             self.aux_like_head = nn.Linear(hidden_dim, 1)
             self.aux_comment_head = nn.Linear(hidden_dim, 1)
@@ -246,17 +240,6 @@ class HeteroIntentPLE(nn.Module):
             **user_extra,
             **ranker_extra,
         }
-        if self.use_rank_head:
-            rank_logit = self.rank_score_head(h).squeeze(-1)
-            rank_score = torch.sigmoid(rank_logit)
-            final_score = (1.0 - self.rank_score_blend) * weighted_prob_score + self.rank_score_blend * rank_score
-            result.update(
-                {
-                    "rank_logit": rank_logit,
-                    "rank_score": rank_score,
-                    "final_score": final_score,
-                }
-            )
         if self.enable_aux_heads:
             result.update(
                 {
